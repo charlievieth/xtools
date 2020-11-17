@@ -1,0 +1,9 @@
+package cgoimport
+
+import (
+	"github.com/charlievieth/xtools/lsp/cgo"
+)
+
+func _() {
+	cgo.Example() //@godef("ample", funccgoexample),complete("ample", funccgoexample)
+}

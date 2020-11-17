@@ -1,0 +1,9 @@
+package badstmt
+
+import (
+	"github.com/charlievieth/xtools/lsp/foo"
+)
+
+func _() {
+	defer func() { foo. } //@rank(" }", Foo)
+}

@@ -1,0 +1,9 @@
+package badstmt
+
+import (
+	"github.com/charlievieth/xtools/lsp/foo"
+)
+
+func _() {
+	go foo. //@rank(" //", Foo, IntFoo),snippet(" //", Foo, "Foo()", "Foo()")
+}
