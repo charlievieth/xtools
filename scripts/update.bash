@@ -24,7 +24,7 @@ escape_import_path() {
 fix_import_paths() {
     local from="$1"
     local to="$2"
-    local dir="${3:"$ROOT"}"
+    local dir="${3:-$ROOT}"
 
     local replace
     replace="s/$(escape_import_path "$from")/$(escape_import_path "$to")/g"
