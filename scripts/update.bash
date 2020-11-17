@@ -8,14 +8,6 @@ FROM=golang.org/x/tools
 PKG=github.com/charlievieth/xtools
 TO="$PKG"
 
-GREP_FLAGS=(
-    --recursive
-    --exclude-dir 'scripts'
-    --exclude-dir '.git'
-    --files-with-matches
-    --null
-    --fixed-strings
-)
 
 escape_import_path() {
     sed -e 's/\./\\\./g' -e 's/\//\\\//g' <<<"$1"
@@ -29,6 +21,14 @@ fix_import_paths() {
     local replace
     replace="s/$(escape_import_path "$from")/$(escape_import_path "$to")/g"
 
+    GREP_FLAGS=(
+        --recursive
+        --exclude-dir 'scripts'
+        --exclude-dir '.git'
+        --files-with-matches
+        --null
+        --fixed-strings
+    )
     if ! grep "${GREP_FLAGS[@]}" "$from" "$dir" | xargs -0 -- sed -i "$replace"; then
         echo "error: fix_import_paths" >&2
         return 1
@@ -80,7 +80,6 @@ disable_gopls_main
 fix_import_paths golang.org/x/tools/internal github.com/charlievieth/xtools ./gopls
 fix_import_paths golang.org/x/tools/gopls/internal github.com/charlievieth/xtools/gopls ./gopls
 fix_import_paths golang.org/x/tools/gopls github.com/charlievieth/xtools/gopls ./gopls
-
 
 for file in ./gopls/internal/*; do
     dest="./gopls/$(basename "$file")"
