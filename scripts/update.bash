@@ -51,6 +51,11 @@ git fetch --all
 LATEST_SHA="$(git rev-parse golang/master)"
 BRANCH="golang-$(head -c 8 <<<"$LATEST_SHA")"
 
+if git branch | grep -F "$BRANCH"; then
+    git branch -D "$BRANCH" # WARN
+fi
+git checkout -b "$BRANCH"
+
 git checkout golang/master internal
 git restore --staged ./internal
 
@@ -88,5 +93,12 @@ git add ./gopls
 
 GO111MODULE=on go mod tidy
 git add go.mod go.sum
+
+# Make sure we can build gopls
+(
+    cd ./gopls
+    go build -tags never
+    rm ./gopls
+)
 
 git commit -m "update golang.org/x/tools to $(head -c 8 <<<"$LATEST_SHA")"
