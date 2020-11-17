@@ -41,10 +41,10 @@ git fetch --all
 LATEST_SHA="$(git rev-parse golang/master)"
 BRANCH="golang-$(head -c 8 <<<"$LATEST_SHA")"
 
-if git branch | grep -F "$BRANCH"; then
-    git branch -D "$BRANCH"
-fi
-git checkout -b "$BRANCH"
+# if git branch | grep -F "$BRANCH"; then
+#     git branch -D "$BRANCH"
+# fi
+# git checkout -b "$BRANCH"
 
 git checkout golang/master internal
 git restore --staged ./internal
@@ -73,6 +73,12 @@ rm ./gopls/go.{mod,sum}
 
 fix_import_paths golang.org/x/tools/internal github.com/charlievieth/xtools ./gopls
 fix_import_paths golang.org/x/tools/gopls/internal github.com/charlievieth/xtools/gopls ./gopls
+fix_import_paths golang.org/x/tools/gopls github.com/charlievieth/xtools/gopls ./gopls
+
+# Fix main.go
+fix_import_paths 'package main // import "golang.org/x/tools/gopls"' 'package main' ./gopls
+MAIN="$(cat ./gopls/main.go)"
+printf '// +build never\n\n%s' "$MAIN" > ./gopls/main.go
 
 for file in ./gopls/internal/*; do
     dest="./gopls/$(basename "$file")"
@@ -83,7 +89,7 @@ rm -r ./gopls/internal
 
 git add ./gopls
 
-GO111MODULE=on go mod tidy
-git add go.mod go.sum
+# GO111MODULE=on go mod tidy
+# git add go.mod go.sum
 
 git commit -m "update golang.org/x/tools to $(head -c 8 <<<"$LATEST_SHA")"
