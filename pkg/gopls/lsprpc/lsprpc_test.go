@@ -6,6 +6,7 @@ package lsprpc
 
 import (
 	"context"
+	"os/exec"
 	"regexp"
 	"sync"
 	"testing"
@@ -321,5 +322,24 @@ func TestEnvForwarding(t *testing.T) {
 	// Check that the variable present in our user config was not overwritten.
 	if v := env["GONOPROXY"]; v != "example.com" {
 		t.Errorf("GONOPROXY environment variable was overwritten")
+	}
+}
+
+func TestDefaultRemoteConfig(t *testing.T) {
+	exp, err := exec.LookPath("gopls")
+	if err != nil {
+		t.Skip("missing gopls executable")
+		return
+	}
+	rcfg := defaultRemoteConfig()
+	if rcfg.goplsPath != exp {
+		t.Errorf("goplsPath: got: %q want: %q", rcfg.goplsPath, exp)
+	}
+	gp, err := rcfg.GoplsPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gp != exp {
+		t.Errorf("goplsPath: got: %q want: %q", gp, exp)
 	}
 }

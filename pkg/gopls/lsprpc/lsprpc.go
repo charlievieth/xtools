@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// TODO (CEV): remove support for creating the gopls daemon/server since we
+// only use this to create forwarders/clients.
+//
 // Package lsprpc implements a jsonrpc2.StreamServer that may be used to
 // serve the LSP on a jsonrpc2 channel.
 package lsprpc
@@ -13,6 +16,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -24,13 +28,14 @@ import (
 	"github.com/charlievieth/xtools/lsp/cache"
 	"github.com/charlievieth/xtools/lsp/debug"
 	"github.com/charlievieth/xtools/lsp/debug/tag"
+	"github.com/charlievieth/xtools/lsp/lsprpc"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	errors "golang.org/x/xerrors"
 )
 
 // AutoNetwork is the pseudo network type used to signal that gopls should use
 // automatic discovery to resolve a remote address.
-const AutoNetwork = "auto"
+const AutoNetwork = lsprpc.AutoNetwork // "auto"
 
 // Unique identifiers for client/server.
 var serverIndex int64
@@ -70,7 +75,7 @@ func (s *StreamServer) ServeStream(ctx context.Context, conn jsonrpc2.Conn) erro
 			event.Error(ctx, "error shutting down", err)
 		}
 	}()
-	executable, err := os.Executable()
+	executable, err := lookupGoplsPath()
 	if err != nil {
 		log.Printf("error getting gopls path: %v", err)
 		executable = ""
@@ -109,6 +114,16 @@ type remoteConfig struct {
 	debug         string
 	listenTimeout time.Duration
 	logfile       string
+	goplsPath     string
+}
+
+// WARN: remove if not used.
+func (c *remoteConfig) GoplsPath() (string, error) {
+	var err error
+	if c.goplsPath == "" {
+		c.goplsPath, err = lookupGoplsPath()
+	}
+	return c.goplsPath, err
 }
 
 // A RemoteOption configures the behavior of the auto-started remote.
@@ -140,21 +155,35 @@ func (l RemoteLogfile) set(cfg *remoteConfig) {
 	cfg.logfile = string(l)
 }
 
+// RemoteGoplsPath configures the path of the gopls executable for the
+// auto-started gopls daemon.
+type RemoteGoplsPath string
+
+func (l RemoteGoplsPath) set(cfg *remoteConfig) {
+	cfg.goplsPath = string(l)
+}
+
+// WARN: remove if not used
+//
+// RemoteLookupGoplsPath causes exec.LookPath("gopls") to be used to find the
+// path of the gopls executable for the remote daemon.
+// type RemoteLookupGoplsPath struct{}
+//
+// func (RemoteLookupGoplsPath) set(cfg *remoteConfig) {
+// 	cfg.goplsPath, _ = exec.LookPath("gopls")
+// }
+
 func defaultRemoteConfig() remoteConfig {
+	goplsPath, _ := lookupGoplsPath()
 	return remoteConfig{
 		listenTimeout: 1 * time.Minute,
+		goplsPath:     goplsPath,
 	}
 }
 
 // NewForwarder creates a new Forwarder, ready to forward connections to the
 // remote server specified by network and addr.
 func NewForwarder(network, addr string, opts ...RemoteOption) *Forwarder {
-	gp, err := os.Executable()
-	if err != nil {
-		log.Printf("error getting gopls path for forwarder: %v", err)
-		gp = ""
-	}
-
 	rcfg := defaultRemoteConfig()
 	for _, opt := range opts {
 		opt.set(&rcfg)
@@ -163,7 +192,7 @@ func NewForwarder(network, addr string, opts ...RemoteOption) *Forwarder {
 	fwd := &Forwarder{
 		network:      network,
 		addr:         addr,
-		goplsPath:    gp,
+		goplsPath:    rcfg.goplsPath,
 		remoteConfig: rcfg,
 	}
 	return fwd
@@ -172,9 +201,9 @@ func NewForwarder(network, addr string, opts ...RemoteOption) *Forwarder {
 // QueryServerState queries the server state of the current server.
 func QueryServerState(ctx context.Context, network, address string) (*ServerState, error) {
 	if network == AutoNetwork {
-		gp, err := os.Executable()
+		gp, err := lookupGoplsPath()
 		if err != nil {
-			return nil, errors.Errorf("getting gopls path: %w", err)
+			return nil, err
 		}
 		network, address = autoNetworkAddress(gp, address)
 	}
@@ -264,7 +293,11 @@ func (f *Forwarder) ServeStream(ctx context.Context, clientConn jsonrpc2.Conn) e
 }
 
 func (f *Forwarder) connectToRemote(ctx context.Context) (net.Conn, error) {
-	return connectToRemote(ctx, f.network, f.addr, f.goplsPath, f.remoteConfig)
+	goplsPath, err := f.remoteConfig.GoplsPath()
+	if err != nil {
+		return nil, err
+	}
+	return connectToRemote(ctx, f.network, f.addr, goplsPath, f.remoteConfig)
 }
 
 func ConnectToRemote(ctx context.Context, network, addr string, opts ...RemoteOption) (net.Conn, error) {
@@ -274,7 +307,7 @@ func ConnectToRemote(ctx context.Context, network, addr string, opts ...RemoteOp
 	}
 	// This is not strictly necessary, as it won't be used if not connecting to
 	// the 'auto' remote.
-	goplsPath, err := os.Executable()
+	goplsPath, err := rcfg.GoplsPath()
 	if err != nil {
 		return nil, fmt.Errorf("unable to resolve gopls path: %v", err)
 	}
@@ -565,4 +598,12 @@ func sendError(ctx context.Context, reply jsonrpc2.Replier, err error) {
 	if err := reply(ctx, nil, err); err != nil {
 		event.Error(ctx, "", err)
 	}
+}
+
+func lookupGoplsPath() (string, error) {
+	path, err := exec.LookPath("gopls")
+	if err != nil {
+		return "", errors.Errorf("getting gopls path: %w", err)
+	}
+	return path, nil
 }
