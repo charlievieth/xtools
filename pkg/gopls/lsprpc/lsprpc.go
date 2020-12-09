@@ -115,6 +115,7 @@ type remoteConfig struct {
 	listenTimeout time.Duration
 	logfile       string
 	goplsPath     string
+	rpcTrace      bool
 }
 
 // WARN: remove if not used.
@@ -161,6 +162,13 @@ type RemoteGoplsPath string
 
 func (l RemoteGoplsPath) set(cfg *remoteConfig) {
 	cfg.goplsPath = string(l)
+}
+
+// RemoteRPCTrace configures enables the rpctrace option for the daemon.
+type RemoteRPCTrace bool
+
+func (trace RemoteRPCTrace) set(cfg *remoteConfig) {
+	cfg.rpcTrace = bool(trace)
 }
 
 // WARN: remove if not used
@@ -372,6 +380,9 @@ func connectToRemote(ctx context.Context, inNetwork, inAddr, goplsPath string, r
 		}
 		if rcfg.debug != "" {
 			args = append(args, "-debug", rcfg.debug)
+		}
+		if rcfg.rpcTrace {
+			args = append(args, "-rpc.trace")
 		}
 		if err := startRemote(goplsPath, args...); err != nil {
 			return nil, errors.Errorf("startRemote(%q, %v): %w", goplsPath, args, err)
