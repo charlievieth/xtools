@@ -37,6 +37,9 @@ import (
 // automatic discovery to resolve a remote address.
 const AutoNetwork = lsprpc.AutoNetwork // "auto"
 
+// DefaultRemoteListenTimeout is the default listen timeout for the daemon.
+const DefaultRemoteListenTimeout = time.Minute * 1
+
 // Unique identifiers for client/server.
 var serverIndex int64
 
@@ -184,7 +187,7 @@ func (trace RemoteRPCTrace) set(cfg *remoteConfig) {
 func defaultRemoteConfig() remoteConfig {
 	goplsPath, _ := lookupGoplsPath()
 	return remoteConfig{
-		listenTimeout: 1 * time.Minute,
+		listenTimeout: DefaultRemoteListenTimeout,
 		goplsPath:     goplsPath,
 	}
 }
