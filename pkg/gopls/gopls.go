@@ -5,16 +5,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/token"
+	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
+	"github.com/charlievieth/xtools/jsonrpc2"
+	"github.com/charlievieth/xtools/lsp"
 	"github.com/charlievieth/xtools/lsp/cmd"
-	"github.com/charlievieth/xtools/lsp/lsprpc"
 	"github.com/charlievieth/xtools/lsp/protocol"
+	"github.com/charlievieth/xtools/lsp/source"
+	"github.com/charlievieth/xtools/pkg/gopls/lsprpc"
 	"github.com/charlievieth/xtools/span"
+	errors "golang.org/x/xerrors"
 )
 
 const DefaultRemoteListenTimeout = time.Minute * 10
@@ -23,39 +30,491 @@ const DefaultRemoteListenTimeout = time.Minute * 10
 type Config struct {
 	Remote string
 
+	// GoplsPath allows the gopls binary used for the backend server to be
+	// overridden, otherwise the first gopls found on the PATH will be used.
+	GoplsPath string
+
 	// RemoteListenTimeout configures the amount of time the auto-started gopls
 	// daemon will wait with no client connections before shutting down.
 	RemoteListenTimeout time.Duration
+
+	// RemoteDebug serve debug information on the supplied address.
+	RemoteDebug string
 
 	// TODO: expose this
 	//
 	// RemoteLogfile configures the logfile location for the auto-started gopls
 	// daemon.
-	// RemoteLogfile string
-
-	// GoplsPath allows the gopls binary used for the backend server to be
-	// overridden, otherwise the first gopls found on the PATH will be used.
-	GoplsPath string
+	RemoteLogfile string
 }
 
-func (c *Config) init() (err error) {
-	if c.Remote == "" {
-		c.Remote = lsprpc.AutoNetwork
+func (conf *Config) init() (err error) {
+	if conf.Remote == "" {
+		conf.Remote = lsprpc.AutoNetwork
 	}
 	switch {
-	case c.RemoteListenTimeout == 0:
-		c.RemoteListenTimeout = DefaultRemoteListenTimeout
-	case c.RemoteListenTimeout < 0:
-		c.RemoteListenTimeout = 0 // disable the timeout
+	case conf.RemoteListenTimeout == 0:
+		conf.RemoteListenTimeout = DefaultRemoteListenTimeout
+	case conf.RemoteListenTimeout < 0:
+		conf.RemoteListenTimeout = 0 // disable the timeout
 	}
-	if c.GoplsPath == "" {
-		c.GoplsPath, err = exec.LookPath("gopls")
+	if conf.GoplsPath == "" {
+		conf.GoplsPath, err = exec.LookPath("gopls")
 		if err != nil {
 			return fmt.Errorf(`missing "gopls" executable: %w`, err)
 		}
 	}
+	if conf.RemoteLogfile != "" {
+		dir := filepath.Dir(conf.RemoteLogfile)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
 	return nil
 }
+
+func Connect(conf *Config) *Client {
+	resolved := *conf
+	if resolved.Remote == "" {
+		resolved.Remote = lsprpc.AutoNetwork
+	}
+	switch {
+	case resolved.RemoteListenTimeout == 0:
+		resolved.RemoteListenTimeout = DefaultRemoteListenTimeout
+	case resolved.RemoteListenTimeout < 0:
+		resolved.RemoteListenTimeout = 0 // disable the timeout
+	}
+	if resolved.GoplsPath == "" {
+		resolved.GoplsPath, _ = exec.LookPath("gopls")
+	}
+	return &Client{}
+}
+
+// TODO (CEV): use per-workspace gopls servers
+type Client struct {
+	config Config
+}
+
+func (c *Client) References(ctx context.Context, location *Location, src interface{}) ([]protocol.Location, error) {
+	var x protocol.Location
+	_ = x
+	return nil, nil
+}
+
+// TODO: consider using cmd/Serve.Run
+func (c *Config) Connect(ctx context.Context) (*Client, error) {
+	// TODO: consider not using a method pointer
+	if err := c.init(); err != nil {
+		return nil, err
+	}
+	lsprpc.ConnectToRemote(ctx, "network", "addr")
+	return nil, nil
+}
+
+// CEV: we'll need something like this to store request scoped data
+type request struct {
+	fset *token.FileSet
+
+	// filesMu sync.Mutex
+	// files   map[span.URI]*cmdFile
+}
+
+// func (c *Client) References(ctx context.Context, params *protocol.ReferenceParams) ([]protocol.Location, error) {
+// 	var x protocol.Location
+// 	_ = x
+// 	return nil, nil
+// }
+
+func main() {
+	const WorkingDirectory = "/Users/cvieth/go/src/github.com/charlievieth/xtools"
+	// ss := lsprpc.NewForwarder("auto", "",
+	// 	lsprpc.RemoteDebugAddress(""),
+	// 	lsprpc.RemoteListenTimeout(DefaultRemoteListenTimeout),
+	// 	lsprpc.RemoteLogfile(""),
+	// )
+	// stream := jsonrpc2.NewHeaderStream(fakenet.NewConn("stdio", os.Stdin, os.Stdout))
+	// conn := jsonrpc2.NewConn(stream)
+
+	ropts := []lsprpc.RemoteOption{
+		lsprpc.RemoteLogfile("/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/tmp/daemon.log"),
+		lsprpc.RemoteDebugAddress(":6060"),
+		lsprpc.RemoteRPCTrace(true),
+		lsprpc.RemoteListenTimeout(time.Second * 5),
+	}
+	ctx := context.Background()
+	conn, err := lsprpc.ConnectToRemote(ctx, lsprpc.AutoNetwork, "", ropts...)
+	if err != nil {
+		Fatal(err)
+	}
+	defer conn.Close()
+
+	connection := newConnection()
+
+	stream := jsonrpc2.NewHeaderStream(conn)
+	cc := jsonrpc2.NewConn(stream)
+	connection.Server = protocol.ServerDispatcher(cc)
+
+	ctx = protocol.WithClient(ctx, connection.Client)
+	cc.Go(ctx,
+		protocol.Handlers(
+			protocol.ClientHandler(connection.Client,
+				jsonrpc2.MethodNotFound)))
+
+	fmt.Println("initialize:", connection.initialize(ctx, WorkingDirectory, nil))
+	return
+
+	// err := ss.ServeStream(ctx, conn)
+
+	// if s.Trace && di != nil {
+	// 	stream = protocol.LoggingStream(stream, di.LogWriter)
+	// }
+
+	// var _ = span.URI("")
+	// const filename = "/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/gopls.go:#1023"
+	// // u := span.URIFromPath(filename)
+	// // fmt.Println(u.Filename())
+
+	// loc := Location{
+	// 	Path: "/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/gopls.go",
+	// 	Point: Point{
+	// 		Offset: 1023,
+	// 		Line:   2,
+	// 		Column: 4,
+	// 	},
+	// }
+	// p := loc.Span()
+	// fmt.Printf("%s\n", p)
+	// fmt.Println(loc)
+
+	// loc := Location{
+	// 	Path:  "/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/gopls.go",
+	// 	Point: Point{Offset: 1023},
+	// }
+	// p1 := span.Parse(filename)
+	// p2 := loc.Span()
+
+	// PrintJSON(&p1)
+	// PrintJSON(&p2)
+	// fmt.Println(span.Compare(p1, p2))
+	// return
+
+	// fmt.Printf("%+v\n", p)
+	// fmt.Println(p.URI().Filename(), p.URI().IsFile())
+	// fmt.Println("HasOffset:", p.HasOffset())
+	// fmt.Println("HasPosition:", p.HasPosition())
+}
+
+////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+
+func (c *Client) newConnection() *connection {
+	return nil
+}
+
+type connection struct {
+	protocol.Server
+	Client *cmdClient
+}
+
+type cmdClient struct {
+	protocol.Server
+
+	// WARN (CEV): fix me
+	// app  *Application
+
+	fset *token.FileSet
+
+	logMessage func(ctx context.Context, p *protocol.LogMessageParams) error
+
+	diagnosticsMu   sync.Mutex
+	diagnosticsDone chan struct{}
+
+	filesMu sync.Mutex
+	files   map[span.URI]*cmdFile
+}
+
+type cmdFile struct {
+	uri         span.URI
+	mapper      *protocol.ColumnMapper
+	err         error
+	added       bool
+	diagnostics []protocol.Diagnostic
+}
+
+func newConnection( /* app *Application */ ) *connection {
+	return &connection{
+		Client: &cmdClient{
+			// app:   app,
+			fset:  token.NewFileSet(),
+			files: make(map[span.URI]*cmdFile),
+		},
+	}
+}
+
+// fileURI converts a DocumentURI to a file:// span.URI, panicking if it's not a file.
+func fileURI(uri protocol.DocumentURI) span.URI {
+	sURI := uri.SpanURI()
+	if !sURI.IsFile() {
+		panic(fmt.Sprintf("%q is not a file URI", uri))
+	}
+	return sURI
+}
+
+var matcherString = map[source.SymbolMatcher]string{
+	source.SymbolFuzzy:           "fuzzy",
+	source.SymbolCaseSensitive:   "caseSensitive",
+	source.SymbolCaseInsensitive: "caseInsensitive",
+}
+
+func (c *connection) initialize(ctx context.Context, wd string, options func(*source.Options)) error {
+	params := &protocol.ParamInitialize{}
+	// WARN (CEV): make this more configurable
+	// params.RootURI = protocol.URIFromPath(c.Client.app.wd)
+	params.RootURI = protocol.URIFromPath(wd)
+	params.Capabilities.Workspace.Configuration = true
+
+	// Make sure to respect configured options when sending initialize request.
+	opts := source.DefaultOptions().Clone()
+	if options != nil {
+		options(opts)
+	}
+	params.Capabilities.TextDocument.Hover = protocol.HoverClientCapabilities{
+		ContentFormat: []protocol.MarkupKind{opts.PreferredContentFormat},
+	}
+	params.Capabilities.TextDocument.DocumentSymbol.HierarchicalDocumentSymbolSupport = opts.HierarchicalDocumentSymbolSupport
+	params.Capabilities.TextDocument.SemanticTokens = protocol.SemanticTokensClientCapabilities{}
+	params.Capabilities.TextDocument.SemanticTokens.Formats = []string{"relative"}
+	params.Capabilities.TextDocument.SemanticTokens.Requests.Range = true
+	params.Capabilities.TextDocument.SemanticTokens.Requests.Full = true
+	params.Capabilities.TextDocument.SemanticTokens.TokenTypes = lsp.SemanticTypes()
+	params.Capabilities.TextDocument.SemanticTokens.TokenModifiers = lsp.SemanticModifiers()
+	params.InitializationOptions = map[string]interface{}{
+		"symbolMatcher": matcherString[opts.SymbolMatcher],
+	}
+	if _, err := c.Server.Initialize(ctx, params); err != nil {
+		return err
+	}
+	if err := c.Server.Initialized(ctx, &protocol.InitializedParams{}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *cmdClient) ShowMessage(ctx context.Context, p *protocol.ShowMessageParams) error { return nil }
+
+func (c *cmdClient) ShowMessageRequest(ctx context.Context, p *protocol.ShowMessageRequestParams) (*protocol.MessageActionItem, error) {
+	return nil, nil
+}
+
+// WARN (CEV): fix the logging logic
+func (c *cmdClient) LogMessage(ctx context.Context, p *protocol.LogMessageParams) error {
+	if c.logMessage != nil {
+		return c.logMessage(ctx, p)
+	}
+	switch p.Type {
+	case protocol.Error:
+		log.Print("Error:", p.Message)
+	case protocol.Warning:
+		log.Print("Warning:", p.Message)
+	case protocol.Info:
+		// if c.app.verbose() {
+		log.Print("Info:", p.Message)
+		// }
+	case protocol.Log:
+		// if c.app.verbose() {
+		log.Print("Log:", p.Message)
+		// }
+	default:
+		// if c.app.verbose() {
+		log.Printf("%v: %v", p.Type, p.Message)
+		// }
+	}
+	return nil
+}
+
+func (c *cmdClient) Event(ctx context.Context, t *interface{}) error { return nil }
+
+func (c *cmdClient) RegisterCapability(ctx context.Context, p *protocol.RegistrationParams) error {
+	return nil
+}
+
+func (c *cmdClient) UnregisterCapability(ctx context.Context, p *protocol.UnregistrationParams) error {
+	return nil
+}
+
+func (c *cmdClient) WorkspaceFolders(ctx context.Context) ([]protocol.WorkspaceFolder, error) {
+	return nil, nil
+}
+
+func (c *cmdClient) Configuration(ctx context.Context, p *protocol.ParamConfiguration) ([]interface{}, error) {
+	results := make([]interface{}, len(p.Items))
+	for i, item := range p.Items {
+		if item.Section != "gopls" {
+			continue
+		}
+		env := map[string]interface{}{}
+		// WARN (CEV): fix me
+		//
+		// for _, value := range c.app.env {
+		// 	l := strings.SplitN(value, "=", 2)
+		// 	if len(l) != 2 {
+		// 		continue
+		// 	}
+		// 	env[l[0]] = l[1]
+		// }
+		m := map[string]interface{}{
+			"env": env,
+			"analyses": map[string]bool{
+				"fillreturns":    true,
+				"nonewvars":      true,
+				"noresultvalues": true,
+				"undeclaredname": true,
+			},
+		}
+		// WARN (CEV): fix me
+		// if c.app.VeryVerbose {
+		m["verboseOutput"] = true
+		// }
+		results[i] = m
+	}
+	return results, nil
+}
+
+func (c *cmdClient) ApplyEdit(ctx context.Context, p *protocol.ApplyWorkspaceEditParams) (*protocol.ApplyWorkspaceEditResponse, error) {
+	return &protocol.ApplyWorkspaceEditResponse{Applied: false, FailureReason: "not implemented"}, nil
+}
+
+func (c *cmdClient) PublishDiagnostics(ctx context.Context, p *protocol.PublishDiagnosticsParams) error {
+	if p.URI == "gopls://diagnostics-done" {
+		close(c.diagnosticsDone)
+	}
+	// Don't worry about diagnostics without versions.
+	if p.Version == 0 {
+		return nil
+	}
+
+	c.filesMu.Lock()
+	defer c.filesMu.Unlock()
+
+	file := c.getFile(ctx, fileURI(p.URI))
+	file.diagnostics = p.Diagnostics
+	return nil
+}
+
+func (c *cmdClient) Progress(context.Context, *protocol.ProgressParams) error {
+	return nil
+}
+
+func (c *cmdClient) WorkDoneProgressCreate(context.Context, *protocol.WorkDoneProgressCreateParams) error {
+	return nil
+}
+
+func (c *cmdClient) getFile(ctx context.Context, uri span.URI) *cmdFile {
+	file, found := c.files[uri]
+	if !found || file.err != nil {
+		file = &cmdFile{
+			uri: uri,
+		}
+		c.files[uri] = file
+	}
+	if file.mapper == nil {
+		fname := uri.Filename()
+		content, err := ioutil.ReadFile(fname)
+		if err != nil {
+			file.err = errors.Errorf("getFile: %v: %v", uri, err)
+			return file
+		}
+		f := c.fset.AddFile(fname, -1, len(content))
+		f.SetLinesForContent(content)
+		converter := span.NewContentConverter(fname, content)
+		file.mapper = &protocol.ColumnMapper{
+			URI:       uri,
+			Converter: converter,
+			Content:   content,
+		}
+	}
+	return file
+}
+
+// TODO (CEV): support in-memory files
+func (c *connection) AddFile(ctx context.Context, uri span.URI) *cmdFile {
+	c.Client.filesMu.Lock()
+	defer c.Client.filesMu.Unlock()
+
+	file := c.Client.getFile(ctx, uri)
+	// This should never happen.
+	if file == nil {
+		return &cmdFile{
+			uri: uri,
+			err: fmt.Errorf("no file found for %s", uri),
+		}
+	}
+	if file.err != nil || file.added {
+		return file
+	}
+	file.added = true
+	p := &protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{
+			URI:        protocol.URIFromSpanURI(uri),
+			LanguageID: source.DetectLanguage("", file.uri.Filename()).String(),
+			Version:    1,
+			Text:       string(file.mapper.Content),
+		},
+	}
+	if err := c.Server.DidOpen(ctx, p); err != nil {
+		file.err = errors.Errorf("%v: %v", uri, err)
+	}
+	return file
+}
+
+func (c *connection) semanticTokens(ctx context.Context, file span.URI) (*protocol.SemanticTokens, error) {
+	p := &protocol.SemanticTokensParams{
+		TextDocument: protocol.TextDocumentIdentifier{
+			URI: protocol.URIFromSpanURI(file),
+		},
+	}
+	resp, err := c.Server.SemanticTokensFull(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *connection) diagnoseFiles(ctx context.Context, files []span.URI) error {
+	var untypedFiles []interface{}
+	for _, file := range files {
+		untypedFiles = append(untypedFiles, string(file))
+	}
+	c.Client.diagnosticsMu.Lock()
+	defer c.Client.diagnosticsMu.Unlock()
+
+	c.Client.diagnosticsDone = make(chan struct{})
+	_, err := c.Server.NonstandardRequest(ctx, "gopls/diagnoseFiles", map[string]interface{}{"files": untypedFiles})
+	<-c.Client.diagnosticsDone
+	return err
+}
+
+func (c *connection) terminate(ctx context.Context) {
+	// WARN (CEV): fix me
+	//
+	// if strings.HasPrefix(c.Client.app.Remote, "internal@") {
+	// 	// internal connections need to be left alive for the next test
+	// 	return
+	// }
+
+	//TODO: do we need to handle errors on these calls?
+	c.Shutdown(ctx)
+	//TODO: right now calling exit terminates the process, we should rethink that
+	//server.Exit(ctx)
+}
+
+// Implement io.Closer.
+func (c *cmdClient) Close() error {
+	return nil
+}
+
+////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
 
 // parseAddr parses the -listen flag in to a network, and address.
 // func parseAddr(listen string) (network string, address string) {
@@ -70,15 +529,8 @@ func (c *Config) init() (err error) {
 // 	return "tcp", listen
 // }
 
-// TODO: consider using cmd/Serve.Run
-func (c *Config) Connect(ctx context.Context) (*Client, error) {
-	// TODO: consider not using a method pointer
-	if err := c.init(); err != nil {
-		return nil, err
-	}
-	lsprpc.ConnectToRemote(ctx, "network", "addr")
-	return nil, nil
-}
+////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
 
 type Server struct {
 	Address string
@@ -107,68 +559,7 @@ type Server struct {
 }
 
 func (s *Server) Run(ctx context.Context) error {
-
 	return nil
-}
-
-// CEV: we'll need something like this to store request scoped data
-type request struct {
-	fset *token.FileSet
-
-	// filesMu sync.Mutex
-	// files   map[span.URI]*cmdFile
-}
-
-type Client struct {
-	server protocol.Server // WARN
-}
-
-func (c *Client) References(ctx context.Context, location *Location, src interface{}) ([]protocol.Location, error) {
-	var x protocol.Location
-	_ = x
-	return nil, nil
-}
-
-// func (c *Client) References(ctx context.Context, params *protocol.ReferenceParams) ([]protocol.Location, error) {
-// 	var x protocol.Location
-// 	_ = x
-// 	return nil, nil
-// }
-
-func main() {
-	var _ = span.URI("")
-	const filename = "/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/gopls.go:#1023"
-	// u := span.URIFromPath(filename)
-	// fmt.Println(u.Filename())
-
-	loc := Location{
-		Path: "/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/gopls.go",
-		Point: Point{
-			Offset: 1023,
-			Line:   2,
-			Column: 4,
-		},
-	}
-	p := loc.Span()
-	fmt.Printf("%s\n", p)
-	fmt.Println(loc)
-
-	// loc := Location{
-	// 	Path:  "/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/gopls.go",
-	// 	Point: Point{Offset: 1023},
-	// }
-	// p1 := span.Parse(filename)
-	// p2 := loc.Span()
-
-	// PrintJSON(&p1)
-	// PrintJSON(&p2)
-	// fmt.Println(span.Compare(p1, p2))
-	return
-
-	// fmt.Printf("%+v\n", p)
-	// fmt.Println(p.URI().Filename(), p.URI().IsFile())
-	// fmt.Println("HasOffset:", p.HasOffset())
-	// fmt.Println("HasPosition:", p.HasPosition())
 }
 
 func PrintJSON(v interface{}) {
