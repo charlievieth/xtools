@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+# WARN
+# set -x
 
 ROOT="$(dirname "$(cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd)")"
+
+# change to root directory
+cd "$ROOT"
 
 FROM=golang.org/x/tools
 PKG=github.com/charlievieth/xtools
@@ -63,11 +68,17 @@ fix_import_paths golang.org/x/tools/internal github.com/charlievieth/xtools ./in
 
 for file in ./internal/*; do
     dest="./$(basename "$file")"
+    if [[ -d "$dest" ]]; then
+        git rm -rf "$dest"
+    elif [[ -f "$dest" ]]; then
+        git rm -f "$dest"
+    fi
     mv "$file" "$dest"
     git add "$dest"
 done
 rm -r ./internal
 
+rm -r ./gopls
 git checkout golang/master gopls
 git restore --staged ./gopls
 
@@ -83,6 +94,12 @@ fix_import_paths golang.org/x/tools/gopls github.com/charlievieth/xtools/gopls .
 
 for file in ./gopls/internal/*; do
     dest="./gopls/$(basename "$file")"
+    if [[ -e "$dest" ]]; then
+        # This should not happen since we first delete the
+        # gopls directory
+        echo "WARN: overwriting: $dest"
+    fi
+    rm -rf "$dest"
     mv "$file" "$dest"
     git add "$dest"
 done
