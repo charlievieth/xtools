@@ -9,6 +9,8 @@
 // serve the LSP on a jsonrpc2 channel.
 package lsprpc
 
+// WARN (CEV): don't use the global logger!!!
+
 import (
 	"context"
 	"encoding/json"

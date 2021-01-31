@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,8 +24,6 @@ import (
 	"github.com/charlievieth/xtools/span"
 	errors "golang.org/x/xerrors"
 )
-
-const DefaultRemoteListenTimeout = time.Minute * 10
 
 // TODO: consider using cmd/Serve.Run
 type Config struct {
@@ -46,6 +45,11 @@ type Config struct {
 	// RemoteLogfile configures the logfile location for the auto-started gopls
 	// daemon.
 	RemoteLogfile string
+
+	// RemoteRPCTrace configures the rpc.trace option for the remote daemon.
+	RemoteRPCTrace bool
+
+	// TODO: add RemoteVerbose option
 }
 
 func (conf *Config) init() (err error) {
@@ -54,7 +58,7 @@ func (conf *Config) init() (err error) {
 	}
 	switch {
 	case conf.RemoteListenTimeout == 0:
-		conf.RemoteListenTimeout = DefaultRemoteListenTimeout
+		conf.RemoteListenTimeout = lsprpc.DefaultRemoteListenTimeout
 	case conf.RemoteListenTimeout < 0:
 		conf.RemoteListenTimeout = 0 // disable the timeout
 	}
@@ -78,16 +82,21 @@ func Connect(conf *Config) *Client {
 	if resolved.Remote == "" {
 		resolved.Remote = lsprpc.AutoNetwork
 	}
-	switch {
-	case resolved.RemoteListenTimeout == 0:
-		resolved.RemoteListenTimeout = DefaultRemoteListenTimeout
-	case resolved.RemoteListenTimeout < 0:
-		resolved.RemoteListenTimeout = 0 // disable the timeout
+	// WARN (CEV): make sure this is correct (with our defaults)
+	//
+	// Use default timeout if not set
+	if resolved.RemoteListenTimeout == 0 {
+		// TODO (CEV): make this longer by default
+		resolved.RemoteListenTimeout = lsprpc.DefaultRemoteListenTimeout
+	}
+	// Listen indefinitely if less than zero.
+	if resolved.RemoteListenTimeout < 0 {
+		resolved.RemoteListenTimeout = 0
 	}
 	if resolved.GoplsPath == "" {
 		resolved.GoplsPath, _ = exec.LookPath("gopls")
 	}
-	return &Client{}
+	return &Client{config: resolved}
 }
 
 // TODO (CEV): use per-workspace gopls servers
@@ -125,95 +134,215 @@ type request struct {
 // 	return nil, nil
 // }
 
+/*
 func main() {
-	const WorkingDirectory = "/Users/cvieth/go/src/github.com/charlievieth/xtools"
-	// ss := lsprpc.NewForwarder("auto", "",
-	// 	lsprpc.RemoteDebugAddress(""),
-	// 	lsprpc.RemoteListenTimeout(DefaultRemoteListenTimeout),
-	// 	lsprpc.RemoteLogfile(""),
-	// )
-	// stream := jsonrpc2.NewHeaderStream(fakenet.NewConn("stdio", os.Stdin, os.Stdout))
-	// conn := jsonrpc2.NewConn(stream)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	ropts := []lsprpc.RemoteOption{
-		lsprpc.RemoteLogfile("/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/tmp/daemon.log"),
-		lsprpc.RemoteDebugAddress(":6060"),
-		lsprpc.RemoteRPCTrace(true),
-		lsprpc.RemoteListenTimeout(time.Second * 5),
+	cmd := exec.CommandContext(ctx, "gopls", "-remote=auto")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		Fatal(err)
 	}
-	ctx := context.Background()
-	conn, err := lsprpc.ConnectToRemote(ctx, lsprpc.AutoNetwork, "", ropts...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		Fatal(err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		Fatal(err)
+	}
+
+	go func() {
+		r := bufio.NewReader(stderr)
+		for {
+			b, e := r.ReadBytes('\n')
+			if len(b) != 0 {
+				fmt.Fprintf(os.Stderr, "ERROR: %s\n", b)
+			}
+			if e != nil {
+				if e != io.EOF {
+					fmt.Fprintf(os.Stderr, "ERROR: reading STDERR: %s\n", err)
+				}
+				break
+			}
+		}
+	}()
+}
+*/
+
+func main() {
+	// {
+	// 	sp := span.Parse("/usr/local/Cellar/go/1.15.5/libexec/src/go/build/build.go:46:2")
+	// 	fmt.Println(sp.Start())
+	// 	fmt.Println(sp.Start().Column())
+	// 	fmt.Println(sp.Start().Line())
+	// 	return
+	// }
+	const WorkingDirectory = "/Users/cvieth/go/src/github.com/charlievieth/xtools"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := Connect(&Config{})
+	conn, err := client.connect(ctx, WorkingDirectory, nil)
 	if err != nil {
 		Fatal(err)
 	}
 	defer conn.Close()
 
+	// line: 327
+	// col:  10
+	// /Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/lsprpc/lsprpc.go
+	const arg = "/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/lsprpc/lsprpc.go:327:10"
+	from := span.Parse(arg)
+
+	// WARN: this opens the file for us
+	file := conn.AddFile(ctx, from.URI())
+	if file.err != nil {
+		Fatal(file.err)
+	}
+
+	loc, err := file.mapper.Location(from)
+	if err != nil {
+		Fatal(err)
+	}
+
+	// CEV: this is done by AddFile
+	//
+	// text, err := ioutil.ReadFile(file.uri.Filename())
+	// if err != nil {
+	// 	Fatal(err)
+	// }
+	// doc := protocol.TextDocumentItem{
+	// 	URI:        protocol.DocumentURI(file.uri),
+	// 	LanguageID: "go",
+	// 	Text:       string(text),
+	// 	Version:    1,
+	// }
+	// err = conn.DidOpen(ctx, &protocol.DidOpenTextDocumentParams{
+	// 	TextDocument: doc,
+	// })
+	// if err != nil {
+	// 	Fatal(err)
+	// }
+
+	tdpp := protocol.TextDocumentPositionParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: loc.URI},
+		Position:     loc.Range.Start,
+	}
+	p := protocol.DefinitionParams{
+		TextDocumentPositionParams: tdpp,
+	}
+	locs, err := conn.Definition(ctx, &p)
+	if err != nil {
+		Fatal(err)
+	}
+	PrintJSON(locs)
+
+	// server state
+	{
+		state, err := lsprpc.QueryServerState(ctx, lsprpc.AutoNetwork, "")
+		if err != nil {
+			Fatal(err)
+		}
+		fmt.Println("### Sessions:")
+		PrintJSON(state)
+		fmt.Println("###")
+	}
+
+	closeReq := protocol.DidCloseTextDocumentParams{
+		TextDocument: protocol.TextDocumentIdentifier{
+			URI: protocol.DocumentURI(file.uri),
+		},
+	}
+	if err := conn.DidClose(ctx, &closeReq); err != nil {
+		Fatal(err)
+	}
+}
+
+func (c *Client) remoteOptions() []lsprpc.RemoteOption {
+	var opts []lsprpc.RemoteOption
+	// WARN (CEV): make sure this is correct (with our defaults)
+	if c.config.RemoteListenTimeout > 0 {
+		opts = append(opts, lsprpc.RemoteListenTimeout(c.config.RemoteListenTimeout))
+	} else if c.config.RemoteListenTimeout < 0 {
+		// WARN: use indefinite timeout for <0
+		opts = append(opts, lsprpc.RemoteListenTimeout(0))
+	}
+	if c.config.RemoteLogfile != "" {
+		opts = append(opts, lsprpc.RemoteLogfile(c.config.RemoteLogfile))
+	}
+	if c.config.RemoteDebug != "" {
+		opts = append(opts, lsprpc.RemoteDebugAddress(c.config.RemoteDebug))
+	}
+	if c.config.RemoteRPCTrace {
+		opts = append(opts, lsprpc.RemoteRPCTrace(c.config.RemoteRPCTrace))
+	}
+	return opts
+}
+
+// parseAddr parses the -listen flag in to a network, and address.
+func parseAddr(listen string) (network string, address string) {
+	// Allow passing just -remote=auto, as a shorthand for using automatic remote
+	// resolution.
+	if listen == lsprpc.AutoNetwork {
+		return lsprpc.AutoNetwork, ""
+	}
+	if parts := strings.SplitN(listen, ";", 2); len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return "tcp", listen
+}
+
+func (c *Client) connect(ctx context.Context, wd string, options func(*source.Options)) (*connection, error) {
+
+	if c.config.RemoteLogfile != "" {
+		dir := filepath.Dir(c.config.RemoteLogfile)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("creating log file directory: %w", err)
+		}
+	}
+
+	network, addr := parseAddr(c.config.Remote)
+	conn, err := lsprpc.ConnectToRemote(ctx, network, addr, c.remoteOptions()...)
+	if err != nil {
+		return nil, err
+	}
+
 	connection := newConnection()
 
 	stream := jsonrpc2.NewHeaderStream(conn)
-	cc := jsonrpc2.NewConn(stream)
-	connection.Server = protocol.ServerDispatcher(cc)
+	connection.conn = jsonrpc2.NewConn(stream)
+	connection.Server = protocol.ServerDispatcher(connection.conn)
 
 	ctx = protocol.WithClient(ctx, connection.Client)
-	cc.Go(ctx,
-		protocol.Handlers(
-			protocol.ClientHandler(connection.Client,
-				jsonrpc2.MethodNotFound)))
+	connection.conn.Go(ctx, protocol.Handlers(
+		protocol.ClientHandler(
+			connection.Client,
+			jsonrpc2.MethodNotFound,
+		),
+	))
 
-	fmt.Println("initialize:", connection.initialize(ctx, WorkingDirectory, nil))
-	return
-
-	// err := ss.ServeStream(ctx, conn)
-
-	// if s.Trace && di != nil {
-	// 	stream = protocol.LoggingStream(stream, di.LogWriter)
-	// }
-
-	// var _ = span.URI("")
-	// const filename = "/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/gopls.go:#1023"
-	// // u := span.URIFromPath(filename)
-	// // fmt.Println(u.Filename())
-
-	// loc := Location{
-	// 	Path: "/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/gopls.go",
-	// 	Point: Point{
-	// 		Offset: 1023,
-	// 		Line:   2,
-	// 		Column: 4,
-	// 	},
-	// }
-	// p := loc.Span()
-	// fmt.Printf("%s\n", p)
-	// fmt.Println(loc)
-
-	// loc := Location{
-	// 	Path:  "/Users/cvieth/go/src/github.com/charlievieth/xtools/pkg/gopls/gopls.go",
-	// 	Point: Point{Offset: 1023},
-	// }
-	// p1 := span.Parse(filename)
-	// p2 := loc.Span()
-
-	// PrintJSON(&p1)
-	// PrintJSON(&p2)
-	// fmt.Println(span.Compare(p1, p2))
-	// return
-
-	// fmt.Printf("%+v\n", p)
-	// fmt.Println(p.URI().Filename(), p.URI().IsFile())
-	// fmt.Println("HasOffset:", p.HasOffset())
-	// fmt.Println("HasPosition:", p.HasPosition())
+	return connection, connection.initialize(ctx, wd, options)
 }
 
-////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
-
-func (c *Client) newConnection() *connection {
-	return nil
+func (c *connection) Close() error {
+	return c.conn.Close()
 }
 
 type connection struct {
 	protocol.Server
+	conn   jsonrpc2.Conn
 	Client *cmdClient
+}
+
+func newConnection() *connection {
+	return &connection{
+		Client: &cmdClient{
+			fset:  token.NewFileSet(),
+			files: make(map[span.URI]*cmdFile),
+		},
+	}
 }
 
 type cmdClient struct {
@@ -239,16 +368,6 @@ type cmdFile struct {
 	err         error
 	added       bool
 	diagnostics []protocol.Diagnostic
-}
-
-func newConnection( /* app *Application */ ) *connection {
-	return &connection{
-		Client: &cmdClient{
-			// app:   app,
-			fset:  token.NewFileSet(),
-			files: make(map[span.URI]*cmdFile),
-		},
-	}
 }
 
 // fileURI converts a DocumentURI to a file:// span.URI, panicking if it's not a file.
@@ -362,6 +481,8 @@ func (c *cmdClient) Configuration(ctx context.Context, p *protocol.ParamConfigur
 		// 	}
 		// 	env[l[0]] = l[1]
 		// }
+
+		// Docs: xtools/lsp/source/options.go
 		m := map[string]interface{}{
 			"env": env,
 			"analyses": map[string]bool{
@@ -515,19 +636,6 @@ func (c *cmdClient) Close() error {
 
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
-
-// parseAddr parses the -listen flag in to a network, and address.
-// func parseAddr(listen string) (network string, address string) {
-// 	// Allow passing just -remote=auto, as a shorthand for using automatic remote
-// 	// resolution.
-// 	if listen == lsprpc.AutoNetwork {
-// 		return lsprpc.AutoNetwork, ""
-// 	}
-// 	if parts := strings.SplitN(listen, ";", 2); len(parts) == 2 {
-// 		return parts[0], parts[1]
-// 	}
-// 	return "tcp", listen
-// }
 
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
