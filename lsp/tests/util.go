@@ -6,6 +6,7 @@ package tests
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"go/token"
 	"path/filepath"
@@ -108,62 +109,6 @@ func summarizeSymbols(i int, want, got []protocol.DocumentSymbol, reason string,
 	return msg.String()
 }
 
-// FilterWorkspaceSymbols filters to got contained in the given dirs.
-func FilterWorkspaceSymbols(got []protocol.SymbolInformation, dirs map[string]struct{}) []protocol.SymbolInformation {
-	var result []protocol.SymbolInformation
-	for _, si := range got {
-		if _, ok := dirs[filepath.Dir(si.Location.URI.SpanURI().Filename())]; ok {
-			result = append(result, si)
-		}
-	}
-	return result
-}
-
-// DiffWorkspaceSymbols prints the diff between expected and actual workspace
-// symbols test results.
-func DiffWorkspaceSymbols(want, got []protocol.SymbolInformation) string {
-	sort.Slice(want, func(i, j int) bool { return fmt.Sprintf("%v", want[i]) < fmt.Sprintf("%v", want[j]) })
-	sort.Slice(got, func(i, j int) bool { return fmt.Sprintf("%v", got[i]) < fmt.Sprintf("%v", got[j]) })
-	if len(got) != len(want) {
-		return summarizeWorkspaceSymbols(-1, want, got, "different lengths got %v want %v", len(got), len(want))
-	}
-	for i, w := range want {
-		g := got[i]
-		if w.Name != g.Name {
-			return summarizeWorkspaceSymbols(i, want, got, "incorrect name got %v want %v", g.Name, w.Name)
-		}
-		if w.Kind != g.Kind {
-			return summarizeWorkspaceSymbols(i, want, got, "incorrect kind got %v want %v", g.Kind, w.Kind)
-		}
-		if w.Location.URI != g.Location.URI {
-			return summarizeWorkspaceSymbols(i, want, got, "incorrect uri got %v want %v", g.Location.URI, w.Location.URI)
-		}
-		if protocol.CompareRange(w.Location.Range, g.Location.Range) != 0 {
-			return summarizeWorkspaceSymbols(i, want, got, "incorrect range got %v want %v", g.Location.Range, w.Location.Range)
-		}
-	}
-	return ""
-}
-
-func summarizeWorkspaceSymbols(i int, want, got []protocol.SymbolInformation, reason string, args ...interface{}) string {
-	msg := &bytes.Buffer{}
-	fmt.Fprint(msg, "workspace symbols failed")
-	if i >= 0 {
-		fmt.Fprintf(msg, " at %d", i)
-	}
-	fmt.Fprint(msg, " because of ")
-	fmt.Fprintf(msg, reason, args...)
-	fmt.Fprint(msg, ":\nexpected:\n")
-	for _, s := range want {
-		fmt.Fprintf(msg, "  %v %v %v:%v\n", s.Name, s.Kind, s.Location.URI, s.Location.Range)
-	}
-	fmt.Fprintf(msg, "got:\n")
-	for _, s := range got {
-		fmt.Fprintf(msg, "  %v %v %v:%v\n", s.Name, s.Kind, s.Location.URI, s.Location.Range)
-	}
-	return msg.String()
-}
-
 // DiffDiagnostics prints the diff between expected and actual diagnostics test
 // results.
 func DiffDiagnostics(uri span.URI, want, got []*source.Diagnostic) string {
@@ -184,20 +129,32 @@ func DiffDiagnostics(uri span.URI, want, got []*source.Diagnostic) string {
 		if w.Source != g.Source {
 			return summarizeDiagnostics(i, uri, want, got, "incorrect Source got %v want %v", g.Source, w.Source)
 		}
-		// Don't check the range on the badimport test.
-		if strings.Contains(uri.Filename(), "badimport") {
-			continue
-		}
-		if protocol.ComparePosition(w.Range.Start, g.Range.Start) != 0 {
-			return summarizeDiagnostics(i, uri, want, got, "incorrect Start got %v want %v", g.Range.Start, w.Range.Start)
-		}
-		if !protocol.IsPoint(g.Range) { // Accept any 'want' range if the diagnostic returns a zero-length range.
-			if protocol.ComparePosition(w.Range.End, g.Range.End) != 0 {
-				return summarizeDiagnostics(i, uri, want, got, "incorrect End got %v want %v", g.Range.End, w.Range.End)
-			}
+		if !rangeOverlaps(g.Range, w.Range) {
+			return summarizeDiagnostics(i, uri, want, got, "range %v does not overlap %v", g.Range, w.Range)
 		}
 	}
 	return ""
+}
+
+// rangeOverlaps reports whether r1 and r2 overlap.
+func rangeOverlaps(r1, r2 protocol.Range) bool {
+	if inRange(r2.Start, r1) || inRange(r1.Start, r2) {
+		return true
+	}
+	return false
+}
+
+// inRange reports whether p is contained within [r.Start, r.End), or if p ==
+// r.Start == r.End (special handling for the case where the range is a single
+// point).
+func inRange(p protocol.Position, r protocol.Range) bool {
+	if protocol.IsPoint(r) {
+		return protocol.ComparePosition(r.Start, p) == 0
+	}
+	if protocol.ComparePosition(r.Start, p) <= 0 && protocol.ComparePosition(p, r.End) < 0 {
+		return true
+	}
+	return false
 }
 
 func summarizeDiagnostics(i int, uri span.URI, want, got []*source.Diagnostic, reason string, args ...interface{}) string {
@@ -280,25 +237,28 @@ func summarizeCodeLens(i int, uri span.URI, want, got []protocol.CodeLens, reaso
 	return msg.String()
 }
 
-func DiffSignatures(spn span.Span, want, got *protocol.SignatureHelp) string {
+func DiffSignatures(spn span.Span, want, got *protocol.SignatureHelp) (string, error) {
 	decorate := func(f string, args ...interface{}) string {
 		return fmt.Sprintf("invalid signature at %s: %s", spn, fmt.Sprintf(f, args...))
 	}
 	if len(got.Signatures) != 1 {
-		return decorate("wanted 1 signature, got %d", len(got.Signatures))
+		return decorate("wanted 1 signature, got %d", len(got.Signatures)), nil
 	}
 	if got.ActiveSignature != 0 {
-		return decorate("wanted active signature of 0, got %d", int(got.ActiveSignature))
+		return decorate("wanted active signature of 0, got %d", int(got.ActiveSignature)), nil
 	}
 	if want.ActiveParameter != got.ActiveParameter {
-		return decorate("wanted active parameter of %d, got %d", want.ActiveParameter, int(got.ActiveParameter))
+		return decorate("wanted active parameter of %d, got %d", want.ActiveParameter, int(got.ActiveParameter)), nil
 	}
 	g := got.Signatures[0]
 	w := want.Signatures[0]
 	if w.Label != g.Label {
 		wLabel := w.Label + "\n"
-		d := myers.ComputeEdits("", wLabel, g.Label+"\n")
-		return decorate("mismatched labels:\n%q", diff.ToUnified("want", "got", wLabel, d))
+		d, err := myers.ComputeEdits("", wLabel, g.Label+"\n")
+		if err != nil {
+			return "", err
+		}
+		return decorate("mismatched labels:\n%q", diff.ToUnified("want", "got", wLabel, d)), err
 	}
 	var paramParts []string
 	for _, p := range g.Parameters {
@@ -306,9 +266,9 @@ func DiffSignatures(spn span.Span, want, got *protocol.SignatureHelp) string {
 	}
 	paramsStr := strings.Join(paramParts, ", ")
 	if !strings.Contains(g.Label, paramsStr) {
-		return decorate("expected signature %q to contain params %q", g.Label, paramsStr)
+		return decorate("expected signature %q to contain params %q", g.Label, paramsStr), nil
 	}
-	return ""
+	return "", nil
 }
 
 // DiffCallHierarchyItems returns the diff between expected and actual call locations for incoming/outgoing call hierarchies
@@ -544,13 +504,50 @@ func EnableAllAnalyzers(view source.View, opts *source.Options) {
 	}
 }
 
-func Diff(want, got string) string {
+func WorkspaceSymbolsString(ctx context.Context, data *Data, queryURI span.URI, symbols []protocol.SymbolInformation) (string, error) {
+	queryDir := filepath.Dir(queryURI.Filename())
+	var filtered []string
+	for _, s := range symbols {
+		uri := s.Location.URI.SpanURI()
+		dir := filepath.Dir(uri.Filename())
+		if !source.InDir(queryDir, dir) { // assume queries always issue from higher directories
+			continue
+		}
+		m, err := data.Mapper(uri)
+		if err != nil {
+			return "", err
+		}
+		spn, err := m.Span(s.Location)
+		if err != nil {
+			return "", err
+		}
+		filtered = append(filtered, fmt.Sprintf("%s %s %s", spn, s.Name, s.Kind))
+	}
+	sort.Strings(filtered)
+	return strings.Join(filtered, "\n") + "\n", nil
+}
+
+func WorkspaceSymbolsTestTypeToMatcher(typ WorkspaceSymbolsTestType) source.SymbolMatcher {
+	switch typ {
+	case WorkspaceSymbolsFuzzy:
+		return source.SymbolFuzzy
+	case WorkspaceSymbolsCaseSensitive:
+		return source.SymbolCaseSensitive
+	default:
+		return source.SymbolCaseInsensitive
+	}
+}
+
+func Diff(t *testing.T, want, got string) string {
 	if want == got {
 		return ""
 	}
 	// Add newlines to avoid newline messages in diff.
 	want += "\n"
 	got += "\n"
-	d := myers.ComputeEdits("", want, got)
+	d, err := myers.ComputeEdits("", want, got)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return fmt.Sprintf("%q", diff.ToUnified("want", "got", want, d))
 }

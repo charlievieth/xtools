@@ -61,6 +61,7 @@ func (s *StreamServer) ServeStream(ctx context.Context, conn jsonrpc2.Conn) erro
 	server := s.serverForTest
 	if server == nil {
 		server = lsp.NewServer(session, client)
+		debug.GetInstance(ctx).AddService(server, session)
 	}
 	// Clients may or may not send a shutdown message. Make sure the server is
 	// shut down.
@@ -302,7 +303,7 @@ func connectToRemote(ctx context.Context, inNetwork, inAddr, goplsPath string, r
 		// the user.
 		event.Error(ctx, "unable to check daemon socket owner, failing open", err)
 	} else if !ok {
-		// We succesfully checked that the socket is not owned by us, we fail
+		// We successfully checked that the socket is not owned by us, we fail
 		// closed.
 		return nil, fmt.Errorf("socket %q is owned by a different user", address)
 	}

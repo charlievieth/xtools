@@ -185,11 +185,46 @@ func ShowMessageRequest(title string) SimpleExpectation {
 	}
 }
 
+// DoneWithOpen expects all didOpen notifications currently sent by the editor
+// to be completely processed.
+func (e *Env) DoneWithOpen() Expectation {
+	opens := e.Editor.Stats().DidOpen
+	return CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidOpen), opens)
+}
+
+// DoneWithChange expects all didChange notifications currently sent by the
+// editor to be completely processed.
+func (e *Env) DoneWithChange() Expectation {
+	changes := e.Editor.Stats().DidChange
+	return CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidChange), changes)
+}
+
+// DoneWithSave expects all didSave notifications currently sent by the editor
+// to be completely processed.
+func (e *Env) DoneWithSave() Expectation {
+	saves := e.Editor.Stats().DidSave
+	return CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidSave), saves)
+}
+
+// DoneWithChangeWatchedFiles expects all didChangeWatchedFiles notifications
+// currently sent by the editor to be completely processed.
+func (e *Env) DoneWithChangeWatchedFiles() Expectation {
+	changes := e.Editor.Stats().DidChangeWatchedFiles
+	return CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidChangeWatchedFiles), changes)
+}
+
+// DoneWithClose expects all didClose notifications currently sent by the
+// editor to be completely processed.
+func (e *Env) DoneWithClose() Expectation {
+	changes := e.Editor.Stats().DidClose
+	return CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidClose), changes)
+}
+
 // CompletedWork expects a work item to have been completed >= atLeast times.
 //
 // Since the Progress API doesn't include any hidden metadata, we must use the
 // progress notification title to identify the work we expect to be completed.
-func CompletedWork(title string, atLeast int) SimpleExpectation {
+func CompletedWork(title string, atLeast uint64) SimpleExpectation {
 	check := func(s State) Verdict {
 		if s.completedWork[title] >= atLeast {
 			return Met
@@ -502,6 +537,14 @@ func (e *Env) DiagnosticAtRegexp(name, re string) DiagnosticExpectation {
 	e.T.Helper()
 	pos := e.RegexpSearch(name, re)
 	return DiagnosticExpectation{path: name, pos: &pos, re: re, present: true}
+}
+
+// DiagnosticAtRegexpWithMessage is like DiagnosticAtRegexp, but it also
+// checks for the content of the diagnostic message,
+func (e *Env) DiagnosticAtRegexpWithMessage(name, re, msg string) DiagnosticExpectation {
+	e.T.Helper()
+	pos := e.RegexpSearch(name, re)
+	return DiagnosticExpectation{path: name, pos: &pos, re: re, present: true, message: msg}
 }
 
 // DiagnosticAt asserts that there is a diagnostic entry at the position

@@ -12,7 +12,7 @@ import (
 	"github.com/charlievieth/xtools/span"
 )
 
-func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string) {
+func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string, expectedActions int) {
 	uri := spn.URI()
 	filename := uri.Filename()
 	args := []string{"fix", "-a", fmt.Sprintf("%s", spn)}
@@ -30,6 +30,6 @@ func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)
 		return []byte(got), nil
 	}))
 	if want != got {
-		t.Errorf("suggested fixes failed for %s:\n%s", filename, tests.Diff(want, got))
+		t.Errorf("suggested fixes failed for %s:\n%s", filename, tests.Diff(t, want, got))
 	}
 }

@@ -37,10 +37,11 @@ func TestSource(t *testing.T) {
 }
 
 type runner struct {
-	snapshot source.Snapshot
-	view     source.View
-	data     *tests.Data
-	ctx      context.Context
+	snapshot    source.Snapshot
+	view        source.View
+	data        *tests.Data
+	ctx         context.Context
+	normalizers []tests.Normalizer
 }
 
 func testSource(t *testing.T, datum *tests.Data) {
@@ -62,6 +63,7 @@ func testSource(t *testing.T, datum *tests.Data) {
 	// TODO(golang/go#38212): Delete this once they are enabled by default.
 	tests.EnableAllAnalyzers(view, options)
 	view.SetOptions(ctx, options)
+
 	var modifications []source.FileModification
 	for filename, content := range datum.Config.Overlay {
 		kind := source.DetectLanguage("", filename)
@@ -82,10 +84,11 @@ func testSource(t *testing.T, datum *tests.Data) {
 	snapshot, release := view.Snapshot(ctx)
 	defer release()
 	r := &runner{
-		view:     view,
-		snapshot: snapshot,
-		data:     datum,
-		ctx:      ctx,
+		view:        view,
+		snapshot:    snapshot,
+		data:        datum,
+		ctx:         ctx,
+		normalizers: tests.CollectNormalizers(datum.Exported),
 	}
 	tests.Run(t, r, datum)
 }
@@ -530,7 +533,10 @@ func (r *runner) Import(t *testing.T, spn span.Span) {
 		return []byte(got), nil
 	}))
 	if want != got {
-		d := myers.ComputeEdits(spn.URI(), want, got)
+		d, err := myers.ComputeEdits(spn.URI(), want, got)
+		if err != nil {
+			t.Fatal(err)
+		}
 		t.Errorf("import failed for %s: %s", spn.URI().Filename(), diff.ToUnified("want", "got", want, d))
 	}
 }
@@ -575,7 +581,7 @@ func (r *runner) Definition(t *testing.T, spn span.Span, d tests.Definition) {
 			return []byte(hover), nil
 		}))
 		if hover != expectHover {
-			t.Errorf("hover for %s failed:\n%s", d.Src, tests.Diff(expectHover, hover))
+			t.Errorf("hover for %s failed:\n%s", d.Src, tests.Diff(t, expectHover, hover))
 		}
 	}
 	if !d.OnlyHover {
@@ -814,7 +820,7 @@ func (r *runner) PrepareRename(t *testing.T, src span.Span, want *source.Prepare
 	if err != nil {
 		t.Fatal(err)
 	}
-	item, err := source.PrepareRename(r.ctx, r.snapshot, fh, srcRng.Start)
+	item, _, err := source.PrepareRename(r.ctx, r.snapshot, fh, srcRng.Start)
 	if err != nil {
 		if want.Text != "" { // expected an ident.
 			t.Errorf("prepare rename failed for %v: got error: %v", src, err)
@@ -862,26 +868,27 @@ func (r *runner) Symbols(t *testing.T, uri span.URI, expectedSymbols []protocol.
 	}
 }
 
-func (r *runner) WorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	r.callWorkspaceSymbols(t, query, source.SymbolCaseInsensitive, dirs, expectedSymbols)
+func (r *runner) WorkspaceSymbols(t *testing.T, uri span.URI, query string, typ tests.WorkspaceSymbolsTestType) {
+	r.callWorkspaceSymbols(t, uri, query, typ)
 }
 
-func (r *runner) FuzzyWorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	r.callWorkspaceSymbols(t, query, source.SymbolFuzzy, dirs, expectedSymbols)
-}
-
-func (r *runner) CaseSensitiveWorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	r.callWorkspaceSymbols(t, query, source.SymbolCaseSensitive, dirs, expectedSymbols)
-}
-
-func (r *runner) callWorkspaceSymbols(t *testing.T, query string, matcher source.SymbolMatcher, dirs map[string]struct{}, expectedSymbols []protocol.SymbolInformation) {
+func (r *runner) callWorkspaceSymbols(t *testing.T, uri span.URI, query string, typ tests.WorkspaceSymbolsTestType) {
 	t.Helper()
-	got, err := source.WorkspaceSymbols(r.ctx, matcher, source.PackageQualifiedSymbols, []source.View{r.view}, query)
+
+	matcher := tests.WorkspaceSymbolsTestTypeToMatcher(typ)
+	gotSymbols, err := source.WorkspaceSymbols(r.ctx, matcher, r.view.Options().SymbolStyle, []source.View{r.view}, query)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got = tests.FilterWorkspaceSymbols(got, dirs)
-	if diff := tests.DiffWorkspaceSymbols(expectedSymbols, got); diff != "" {
+	got, err := tests.WorkspaceSymbolsString(r.ctx, r.data, uri, gotSymbols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = filepath.ToSlash(tests.Normalize(got, r.normalizers))
+	want := string(r.data.Golden(fmt.Sprintf("workspace_symbol-%s-%s", strings.ToLower(string(matcher)), query), uri.Filename(), func() ([]byte, error) {
+		return []byte(got), nil
+	}))
+	if diff := tests.Diff(t, want, got); diff != "" {
 		t.Error(diff)
 	}
 }
@@ -913,14 +920,19 @@ func (r *runner) SignatureHelp(t *testing.T, spn span.Span, want *protocol.Signa
 		Signatures:      []protocol.SignatureInformation{*gotSignature},
 		ActiveParameter: float64(gotActiveParameter),
 	}
-	if diff := tests.DiffSignatures(spn, want, got); diff != "" {
+	diff, err := tests.DiffSignatures(spn, want, got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff != "" {
 		t.Error(diff)
 	}
 }
 
 // These are pure LSP features, no source level functionality to be tested.
-func (r *runner) Link(t *testing.T, uri span.URI, wantLinks []tests.Link)         {}
-func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)  {}
+func (r *runner) Link(t *testing.T, uri span.URI, wantLinks []tests.Link) {}
+func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string, expectedActions int) {
+}
 func (r *runner) FunctionExtraction(t *testing.T, start span.Span, end span.Span) {}
 func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens)   {}
 

@@ -1,7 +1,6 @@
 package good //@diag("package", "no_diagnostics", "", "error")
 
 import (
-	_ "go/ast"                              //@prepare("go/ast", "_", "_")
 	"github.com/charlievieth/xtools/lsp/types" //@item(types_import, "types", "\"github.com/charlievieth/xtools/lsp/types\"", "package")
 )
 
