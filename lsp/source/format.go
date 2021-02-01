@@ -14,6 +14,7 @@ import (
 	"go/parser"
 	"go/token"
 	"strings"
+	"text/scanner"
 
 	"github.com/charlievieth/xtools/event"
 	"github.com/charlievieth/xtools/imports"
@@ -172,7 +173,10 @@ func computeFixEdits(snapshot Snapshot, pgf *ParsedGoFile, options *imports.Opti
 	if fixedData == nil || fixedData[len(fixedData)-1] != '\n' {
 		fixedData = append(fixedData, '\n') // ApplyFixes may miss the newline, go figure.
 	}
-	edits := snapshot.View().Options().ComputeEdits(pgf.URI, left, string(fixedData))
+	edits, err := snapshot.View().Options().ComputeEdits(pgf.URI, left, string(fixedData))
+	if err != nil {
+		return nil, err
+	}
 	return ToProtocolEdits(pgf.Mapper, edits)
 }
 
@@ -226,16 +230,23 @@ func importPrefix(src []byte) string {
 		pkgEnd := f.Name.End()
 		importEnd = maybeAdjustToLineEnd(pkgEnd, false)
 	}
-	for _, c := range f.Comments {
-		if end := tok.Offset(c.End()); end > importEnd {
-			// Work-around golang/go#41197: For multi-line comments add +2 to
-			// the offset. The end position does not account for the */ at the
-			// end.
-			endLine := tok.Position(c.End()).Line
-			if end+2 <= tok.Size() && tok.Position(tok.Pos(end+2)).Line == endLine {
-				end += 2
+	for _, cgroup := range f.Comments {
+		for _, c := range cgroup.List {
+			if end := tok.Offset(c.End()); end > importEnd {
+				startLine := tok.Position(c.Pos()).Line
+				endLine := tok.Position(c.End()).Line
+
+				// Work around golang/go#41197 by checking if the comment might
+				// contain "\r", and if so, find the actual end position of the
+				// comment by scanning the content of the file.
+				startOffset := tok.Offset(c.Pos())
+				if startLine != endLine && bytes.Contains(src[startOffset:], []byte("\r")) {
+					if commentEnd := scanForCommentEnd(tok, src[startOffset:]); commentEnd > 0 {
+						end = startOffset + commentEnd
+					}
+				}
+				importEnd = maybeAdjustToLineEnd(tok.Pos(end), true)
 			}
-			importEnd = maybeAdjustToLineEnd(tok.Pos(end), true)
 		}
 	}
 	if importEnd > len(src) {
@@ -244,11 +255,28 @@ func importPrefix(src []byte) string {
 	return string(src[:importEnd])
 }
 
+// scanForCommentEnd returns the offset of the end of the multi-line comment
+// at the start of the given byte slice.
+func scanForCommentEnd(tok *token.File, src []byte) int {
+	var s scanner.Scanner
+	s.Init(bytes.NewReader(src))
+	s.Mode ^= scanner.SkipComments
+
+	t := s.Scan()
+	if t == scanner.Comment {
+		return s.Pos().Offset
+	}
+	return 0
+}
+
 func computeTextEdits(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile, formatted string) ([]protocol.TextEdit, error) {
 	_, done := event.Start(ctx, "source.computeTextEdits")
 	defer done()
 
-	edits := snapshot.View().Options().ComputeEdits(pgf.URI, string(pgf.Src), formatted)
+	edits, err := snapshot.View().Options().ComputeEdits(pgf.URI, string(pgf.Src), formatted)
+	if err != nil {
+		return nil, err
+	}
 	return ToProtocolEdits(pgf.Mapper, edits)
 }
 

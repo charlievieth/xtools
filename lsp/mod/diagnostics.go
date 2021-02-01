@@ -36,7 +36,7 @@ func Diagnostics(ctx context.Context, snapshot source.Snapshot) (map[source.Vers
 				Range:   e.Range,
 				Source:  e.Category,
 			}
-			if e.Category == "syntax" {
+			if e.Category == "syntax" || e.Kind == source.ListError {
 				d.Severity = protocol.SeverityError
 			} else {
 				d.Severity = protocol.SeverityWarning
@@ -51,8 +51,15 @@ func Diagnostics(ctx context.Context, snapshot source.Snapshot) (map[source.Vers
 	return reports, nil
 }
 
-func ErrorsForMod(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]source.Error, error) {
-	tidied, err := snapshot.ModTidy(ctx, fh)
+func ErrorsForMod(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]*source.Error, error) {
+	pm, err := snapshot.ParseMod(ctx, fh)
+	if err != nil {
+		if pm == nil || len(pm.ParseErrors) == 0 {
+			return nil, err
+		}
+		return pm.ParseErrors, nil
+	}
+	tidied, err := snapshot.ModTidy(ctx, pm)
 
 	if source.IsNonFatalGoModError(err) {
 		return nil, nil

@@ -41,6 +41,17 @@ type Editor struct {
 	buffers map[string]buffer
 	// Capabilities / Options
 	serverCapabilities protocol.ServerCapabilities
+
+	// Call metrics for the purpose of expectations. This is done in an ad-hoc
+	// manner for now. Perhaps in the future we should do something more
+	// systematic. Guarded with a separate mutex as calls may need to be accessed
+	// asynchronously via callbacks into the Editor.
+	callsMu sync.Mutex
+	calls   CallCounts
+}
+
+type CallCounts struct {
+	DidOpen, DidChange, DidSave, DidChangeWatchedFiles, DidClose uint64
 }
 
 type buffer struct {
@@ -63,10 +74,10 @@ type EditorConfig struct {
 	Env        map[string]string
 	BuildFlags []string
 
-	// CodeLens is a map defining whether codelens are enabled, keyed by the
-	// codeLens command. CodeLens which are not present in this map are left in
+	// CodeLenses is a map defining whether codelens are enabled, keyed by the
+	// codeLens command. CodeLenses which are not present in this map are left in
 	// their default state.
-	CodeLens map[string]bool
+	CodeLenses map[string]bool
 
 	// SymbolMatcher is the config associated with the "symbolMatcher" gopls
 	// config option.
@@ -76,14 +87,13 @@ type EditorConfig struct {
 	// workspace scope to the entire module.
 	LimitWorkspaceScope bool
 
-	// WithoutWorkspaceFolders is used to simulate opening a single file in the
-	// editor, without a workspace root. In that case, the client sends neither
-	// workspace folders nor a root URI.
-	WithoutWorkspaceFolders bool
-
-	// WorkspaceRoot specifies the root path of the workspace folder used when
-	// initializing gopls in the sandbox. If empty, the Workdir is used.
-	WorkspaceRoot string
+	// WorkspaceFolders is the workspace folders to configure on the LSP server,
+	// relative to the sandbox workdir.
+	//
+	// As a special case, if WorkspaceFolders is nil the editor defaults to
+	// configuring a single workspace folder corresponding to the workdir root.
+	// To explicitly send no workspace folders, use an empty (non-nil) slice.
+	WorkspaceFolders []string
 
 	// EnableStaticcheck enables staticcheck analyzers.
 	EnableStaticcheck bool
@@ -95,6 +105,8 @@ type EditorConfig struct {
 	// Whether to send the current process ID, for testing data that is joined to
 	// the PID. This can only be set by one test.
 	SendPID bool
+
+	DirectoryFilters []string
 
 	VerboseOutput bool
 }
@@ -123,11 +135,17 @@ func (e *Editor) Connect(ctx context.Context, conn jsonrpc2.Conn, hooks ClientHo
 		protocol.Handlers(
 			protocol.ClientHandler(e.client,
 				jsonrpc2.MethodNotFound)))
-	if err := e.initialize(ctx, e.Config.WithoutWorkspaceFolders, e.Config.WorkspaceRoot); err != nil {
+	if err := e.initialize(ctx, e.Config.WorkspaceFolders); err != nil {
 		return nil, err
 	}
 	e.sandbox.Workdir.AddWatcher(e.onFileChanges)
 	return e, nil
+}
+
+func (e *Editor) Stats() CallCounts {
+	e.callsMu.Lock()
+	defer e.callsMu.Unlock()
+	return e.calls
 }
 
 // Shutdown issues the 'shutdown' LSP notification.
@@ -197,9 +215,11 @@ func (e *Editor) configuration() map[string]interface{} {
 	if e.Config.BuildFlags != nil {
 		config["buildFlags"] = e.Config.BuildFlags
 	}
-
-	if e.Config.CodeLens != nil {
-		config["codelens"] = e.Config.CodeLens
+	if e.Config.DirectoryFilters != nil {
+		config["directoryFilters"] = e.Config.DirectoryFilters
+	}
+	if e.Config.CodeLenses != nil {
+		config["codelenses"] = e.Config.CodeLenses
 	}
 	if e.Config.SymbolMatcher != nil {
 		config["symbolMatcher"] = *e.Config.SymbolMatcher
@@ -218,28 +238,29 @@ func (e *Editor) configuration() map[string]interface{} {
 		config["verboseOutput"] = true
 	}
 
-	// TODO(rFindley): uncomment this if/when diagnostics delay is on by
-	// default... and probably change to the new settings name.
-	// config["experimentalDiagnosticsDelay"] = "10ms"
+	// TODO(rFindley): change to the new settings name once it is no longer
+	// designated experimental.
+	config["experimentalDiagnosticsDelay"] = "10ms"
 
 	// ExperimentalWorkspaceModule is only set as a mode, not a configuration.
 	return config
 }
 
-func (e *Editor) initialize(ctx context.Context, withoutWorkspaceFolders bool, editorRootPath string) error {
+func (e *Editor) initialize(ctx context.Context, workspaceFolders []string) error {
 	params := &protocol.ParamInitialize{}
 	params.ClientInfo.Name = "fakeclient"
 	params.ClientInfo.Version = "v1.0.0"
-	if !withoutWorkspaceFolders {
-		rootURI := e.sandbox.Workdir.RootURI()
-		if editorRootPath != "" {
-			rootURI = toURI(e.sandbox.Workdir.AbsPath(editorRootPath))
-		}
-		params.WorkspaceFolders = []protocol.WorkspaceFolder{{
-			URI:  string(rootURI),
-			Name: filepath.Base(rootURI.SpanURI().Filename()),
-		}}
+
+	if workspaceFolders == nil {
+		workspaceFolders = []string{string(e.sandbox.Workdir.RelativeTo)}
 	}
+	for _, folder := range workspaceFolders {
+		params.WorkspaceFolders = append(params.WorkspaceFolders, protocol.WorkspaceFolder{
+			URI:  string(e.sandbox.Workdir.URI(folder)),
+			Name: filepath.Base(folder),
+		})
+	}
+
 	params.Capabilities.Workspace.Configuration = true
 	params.Capabilities.Window.WorkDoneProgress = true
 	// TODO: set client capabilities
@@ -273,35 +294,48 @@ func (e *Editor) initialize(ctx context.Context, withoutWorkspaceFolders bool, e
 	return nil
 }
 
+// onFileChanges is registered to be called by the Workdir on any writes that
+// go through the Workdir API. It is called synchronously by the Workdir.
 func (e *Editor) onFileChanges(ctx context.Context, evts []FileEvent) {
 	if e.Server == nil {
 		return
 	}
-	e.mu.Lock()
-	var lspevts []protocol.FileEvent
-	for _, evt := range evts {
-		// Always send an on-disk change, even for events that seem useless
-		// because they're shadowed by an open buffer.
-		lspevts = append(lspevts, evt.ProtocolEvent)
 
-		if buf, ok := e.buffers[evt.Path]; ok {
-			// Following VS Code, don't honor deletions or changes to dirty buffers.
-			if buf.dirty || evt.ProtocolEvent.Type == protocol.Deleted {
-				continue
-			}
+	// e may be locked when onFileChanges is called, but it is important that we
+	// synchronously increment this counter so that we can subsequently assert on
+	// the number of expected DidChangeWatchedFiles calls.
+	e.callsMu.Lock()
+	e.calls.DidChangeWatchedFiles++
+	e.callsMu.Unlock()
 
-			content, err := e.sandbox.Workdir.ReadFile(evt.Path)
-			if err != nil {
-				continue // A race with some other operation.
+	// Since e may be locked, we must run this mutation asynchronously.
+	go func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		var lspevts []protocol.FileEvent
+		for _, evt := range evts {
+			// Always send an on-disk change, even for events that seem useless
+			// because they're shadowed by an open buffer.
+			lspevts = append(lspevts, evt.ProtocolEvent)
+
+			if buf, ok := e.buffers[evt.Path]; ok {
+				// Following VS Code, don't honor deletions or changes to dirty buffers.
+				if buf.dirty || evt.ProtocolEvent.Type == protocol.Deleted {
+					continue
+				}
+
+				content, err := e.sandbox.Workdir.ReadFile(evt.Path)
+				if err != nil {
+					continue // A race with some other operation.
+				}
+				// During shutdown, this call will fail. Ignore the error.
+				_ = e.setBufferContentLocked(ctx, evt.Path, false, strings.Split(content, "\n"), nil)
 			}
-			// During shutdown, this call will fail. Ignore the error.
-			_ = e.setBufferContentLocked(ctx, evt.Path, false, strings.Split(content, "\n"), nil)
 		}
-	}
-	e.mu.Unlock()
-	e.Server.DidChangeWatchedFiles(ctx, &protocol.DidChangeWatchedFilesParams{
-		Changes: lspevts,
-	})
+		e.Server.DidChangeWatchedFiles(ctx, &protocol.DidChangeWatchedFilesParams{
+			Changes: lspevts,
+		})
+	}()
 }
 
 // OpenFile creates a buffer for the given workdir-relative file.
@@ -342,9 +376,9 @@ func (e *Editor) createBuffer(ctx context.Context, path string, dirty bool, cont
 		dirty:   dirty,
 	}
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.buffers[path] = buf
 	item := textDocumentItem(e.sandbox.Workdir, buf)
-	e.mu.Unlock()
 
 	if e.Server != nil {
 		if err := e.Server.DidOpen(ctx, &protocol.DidOpenTextDocumentParams{
@@ -352,6 +386,9 @@ func (e *Editor) createBuffer(ctx context.Context, path string, dirty bool, cont
 		}); err != nil {
 			return errors.Errorf("DidOpen: %w", err)
 		}
+		e.callsMu.Lock()
+		e.calls.DidOpen++
+		e.callsMu.Unlock()
 	}
 	return nil
 }
@@ -373,6 +410,9 @@ func (e *Editor) CloseBuffer(ctx context.Context, path string) error {
 		}); err != nil {
 			return errors.Errorf("DidClose: %w", err)
 		}
+		e.callsMu.Lock()
+		e.calls.DidClose++
+		e.callsMu.Unlock()
 	}
 	return nil
 }
@@ -397,9 +437,9 @@ func (e *Editor) SaveBuffer(ctx context.Context, path string) error {
 
 func (e *Editor) SaveBufferWithoutActions(ctx context.Context, path string) error {
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	buf, ok := e.buffers[path]
 	if !ok {
-		e.mu.Unlock()
 		return fmt.Errorf(fmt.Sprintf("unknown buffer: %q", path))
 	}
 	content := buf.text()
@@ -408,7 +448,6 @@ func (e *Editor) SaveBufferWithoutActions(ctx context.Context, path string) erro
 	if ok {
 		includeText = syncOptions.Save.IncludeText
 	}
-	e.mu.Unlock()
 
 	docID := e.textDocumentIdentifier(buf.path)
 	if e.Server != nil {
@@ -423,10 +462,8 @@ func (e *Editor) SaveBufferWithoutActions(ctx context.Context, path string) erro
 		return errors.Errorf("writing %q: %w", path, err)
 	}
 
-	e.mu.Lock()
 	buf.dirty = false
 	e.buffers[path] = buf
-	e.mu.Unlock()
 
 	if e.Server != nil {
 		params := &protocol.DidSaveTextDocumentParams{
@@ -441,6 +478,9 @@ func (e *Editor) SaveBufferWithoutActions(ctx context.Context, path string) erro
 		if err := e.Server.DidSave(ctx, params); err != nil {
 			return errors.Errorf("DidSave: %w", err)
 		}
+		e.callsMu.Lock()
+		e.calls.DidSave++
+		e.callsMu.Unlock()
 	}
 	return nil
 }
@@ -569,6 +609,14 @@ func (e *Editor) SetBufferContent(ctx context.Context, path, content string) err
 	return e.setBufferContentLocked(ctx, path, true, lines, nil)
 }
 
+// HasBuffer reports whether the file name is open in the editor.
+func (e *Editor) HasBuffer(name string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := e.buffers[name]
+	return ok
+}
+
 // BufferText returns the content of the buffer with the given name.
 func (e *Editor) BufferText(name string) string {
 	e.mu.Lock()
@@ -628,6 +676,9 @@ func (e *Editor) setBufferContentLocked(ctx context.Context, path string, dirty 
 		if err := e.Server.DidChange(ctx, params); err != nil {
 			return errors.Errorf("DidChange: %w", err)
 		}
+		e.callsMu.Lock()
+		e.calls.DidChange++
+		e.callsMu.Unlock()
 	}
 	return nil
 }
@@ -651,8 +702,10 @@ func (e *Editor) GoToDefinition(ctx context.Context, path string, pos Pos) (stri
 	}
 	newPath := e.sandbox.Workdir.URIToPath(resp[0].URI)
 	newPos := fromProtocolPosition(resp[0].Range.Start)
-	if err := e.OpenFile(ctx, newPath); err != nil {
-		return "", Pos{}, errors.Errorf("OpenFile: %w", err)
+	if !e.HasBuffer(newPath) {
+		if err := e.OpenFile(ctx, newPath); err != nil {
+			return "", Pos{}, errors.Errorf("OpenFile: %w", err)
+		}
 	}
 	return newPath, newPos, nil
 }
@@ -722,6 +775,9 @@ func (e *Editor) codeAction(ctx context.Context, path string, rng *protocol.Rang
 		return errors.Errorf("textDocument/codeAction: %w", err)
 	}
 	for _, action := range actions {
+		if action.Title == "" {
+			return errors.Errorf("empty title for code action")
+		}
 		var match bool
 		for _, o := range only {
 			if action.Kind == o {
@@ -752,6 +808,10 @@ func (e *Editor) codeAction(ctx context.Context, path string, rng *protocol.Rang
 			}); err != nil {
 				return err
 			}
+		}
+		// Some commands may edit files on disk.
+		if err := e.sandbox.Workdir.CheckForFileChanges(ctx); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -812,6 +872,9 @@ func (e *Editor) FormatBuffer(ctx context.Context, path string) error {
 		return fmt.Errorf("before receipt of formatting edits, buffer version changed from %d to %d", version, versionAfter)
 	}
 	edits := convertEdits(resp)
+	if len(edits) == 0 {
+		return nil
+	}
 	return e.editBufferLocked(ctx, path, edits)
 }
 
@@ -898,6 +961,23 @@ func (e *Editor) Completion(ctx context.Context, path string, pos Pos) (*protoco
 		return nil, err
 	}
 	return completions, nil
+}
+
+// AcceptCompletion accepts a completion for the given item at the given
+// position.
+func (e *Editor) AcceptCompletion(ctx context.Context, path string, pos Pos, item protocol.CompletionItem) error {
+	if e.Server == nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := e.buffers[path]
+	if !ok {
+		return fmt.Errorf("buffer %q is not open", path)
+	}
+	return e.editBufferLocked(ctx, path, convertEdits(append([]protocol.TextEdit{
+		*item.TextEdit,
+	}, item.AdditionalTextEdits...)))
 }
 
 // References executes a reference request on the server.

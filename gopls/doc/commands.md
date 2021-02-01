@@ -34,11 +34,23 @@ Identifier: `gopls.tidy`
 tidy runs `go mod tidy` for a module.
 
 
+### **Update go.sum**
+Identifier: `gopls.update_go_sum`
+
+update_go_sum updates the go.sum file for a module.
+
+
 ### **Undeclared name**
 Identifier: `gopls.undeclared_name`
 
 undeclared_name adds a variable declaration for an undeclared
 name.
+
+
+### **go get package**
+Identifier: `gopls.go_get_package`
+
+go_get_package runs `go get` to fetch a package.
 
 
 ### **Add dependency**

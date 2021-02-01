@@ -146,8 +146,11 @@ func Tempdir(txt string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := writeTxtar(txt, RelativeTo(dir)); err != nil {
-		return "", err
+	files := unpackTxt(txt)
+	for name, data := range files {
+		if err := WriteFileData(name, data, RelativeTo(dir)); err != nil {
+			return "", errors.Errorf("writing to tempdir: %w", err)
+		}
 	}
 	return dir, nil
 }
@@ -239,9 +242,9 @@ func (sb *Sandbox) RunGoCommand(ctx context.Context, dir, verb string, args []st
 		inv.WorkingDir = string(sb.Workdir.RelativeTo)
 	}
 	gocmdRunner := &gocommand.Runner{}
-	_, _, _, err := gocmdRunner.RunRaw(ctx, inv)
+	stdout, stderr, _, err := gocmdRunner.RunRaw(ctx, inv)
 	if err != nil {
-		return err
+		return errors.Errorf("go command failed (stdout: %s) (stderr: %s): %v", stdout.String(), stderr.String(), err)
 	}
 	// Since running a go command may result in changes to workspace files,
 	// check if we need to send any any "watched" file events.

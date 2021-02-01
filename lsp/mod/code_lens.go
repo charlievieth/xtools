@@ -1,3 +1,7 @@
+// Copyright 2020 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package mod
 
 import (
@@ -15,101 +19,73 @@ import (
 // LensFuncs returns the supported lensFuncs for go.mod files.
 func LensFuncs() map[string]source.LensFunc {
 	return map[string]source.LensFunc{
-		source.CommandUpgradeDependency.Name: upgradeLens,
+		source.CommandUpgradeDependency.Name: upgradeLenses,
 		source.CommandTidy.Name:              tidyLens,
 		source.CommandVendor.Name:            vendorLens,
 	}
 }
 
-func upgradeLens(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]protocol.CodeLens, error) {
+func upgradeLenses(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]protocol.CodeLens, error) {
 	pm, err := snapshot.ParseMod(ctx, fh)
-	if err != nil {
+	if err != nil || pm.File == nil {
 		return nil, err
 	}
-	module := pm.File.Module
-	if module == nil || module.Syntax == nil {
+	if len(pm.File.Require) == 0 {
+		// Nothing to upgrade.
 		return nil, nil
 	}
-	upgrades, err := snapshot.ModUpgrade(ctx, fh)
+	upgradeTransitiveArgs, err := source.MarshalArgs(fh.URI(), false, []string{"-u", "all"})
 	if err != nil {
 		return nil, err
 	}
-	var (
-		codelenses  []protocol.CodeLens
-		allUpgrades []string
-	)
+	var requires []string
 	for _, req := range pm.File.Require {
-		dep := req.Mod.Path
-		latest, ok := upgrades[dep]
-		if !ok {
-			continue
-		}
-		if req.Syntax == nil {
-			continue
-		}
-		// Get the range of the require directive.
-		rng, err := positionsToRange(fh.URI(), pm.Mapper, req.Syntax.Start, req.Syntax.End)
-		if err != nil {
-			return nil, err
-		}
-		upgradeDepArgs, err := source.MarshalArgs(fh.URI(), false, []string{dep})
-		if err != nil {
-			return nil, err
-		}
-		codelenses = append(codelenses, protocol.CodeLens{
+		requires = append(requires, req.Mod.Path)
+	}
+	upgradeDirectArgs, err := source.MarshalArgs(fh.URI(), false, requires)
+	if err != nil {
+		return nil, err
+	}
+	// Put the upgrade code lenses above the first require block or statement.
+	rng, err := firstRequireRange(fh, pm)
+	if err != nil {
+		return nil, err
+	}
+	return []protocol.CodeLens{
+		{
 			Range: rng,
 			Command: protocol.Command{
-				Title:     fmt.Sprintf("Upgrade dependency to %s", latest),
+				Title:     "Upgrade transitive dependencies",
 				Command:   source.CommandUpgradeDependency.ID(),
-				Arguments: upgradeDepArgs,
+				Arguments: upgradeTransitiveArgs,
 			},
-		})
-		allUpgrades = append(allUpgrades, dep)
-	}
-	// If there is at least 1 upgrade, add "Upgrade all dependencies" to
-	// the module statement.
-	if len(allUpgrades) > 0 {
-		upgradeDepArgs, err := source.MarshalArgs(fh.URI(), false, append([]string{"-u"}, allUpgrades...))
-		if err != nil {
-			return nil, err
-		}
-		// Get the range of the module directive.
-		moduleRng, err := positionsToRange(pm.Mapper.URI, pm.Mapper, module.Syntax.Start, module.Syntax.End)
-		if err != nil {
-			return nil, err
-		}
-		codelenses = append(codelenses, protocol.CodeLens{
-			Range: moduleRng,
+		},
+		{
+			Range: rng,
 			Command: protocol.Command{
-				Title:     "Upgrade all dependencies",
+				Title:     "Upgrade direct dependencies",
 				Command:   source.CommandUpgradeDependency.ID(),
-				Arguments: upgradeDepArgs,
+				Arguments: upgradeDirectArgs,
 			},
-		})
-	}
-	return codelenses, err
+		},
+	}, nil
+
 }
 
 func tidyLens(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]protocol.CodeLens, error) {
+	pm, err := snapshot.ParseMod(ctx, fh)
+	if err != nil || pm.File == nil {
+		return nil, err
+	}
+	if len(pm.File.Require) == 0 {
+		// Nothing to vendor.
+		return nil, nil
+	}
 	goModArgs, err := source.MarshalArgs(fh.URI())
 	if err != nil {
 		return nil, err
 	}
-	tidied, err := snapshot.ModTidy(ctx, fh)
-	if err != nil {
-		return nil, err
-	}
-	if len(tidied.Errors) == 0 {
-		return nil, nil
-	}
-	pm, err := snapshot.ParseMod(ctx, fh)
-	if err != nil {
-		return nil, err
-	}
-	if pm.File == nil || pm.File.Module == nil || pm.File.Module.Syntax == nil {
-		return nil, fmt.Errorf("no parsed go.mod for %s", fh.URI())
-	}
-	rng, err := positionsToRange(pm.Mapper.URI, pm.Mapper, pm.File.Module.Syntax.Start, pm.File.Module.Syntax.End)
+	rng, err := moduleStmtRange(fh, pm)
 	if err != nil {
 		return nil, err
 	}
@@ -120,22 +96,19 @@ func tidyLens(ctx context.Context, snapshot source.Snapshot, fh source.FileHandl
 			Command:   source.CommandTidy.ID(),
 			Arguments: goModArgs,
 		},
-	}}, err
+	}}, nil
 }
 
 func vendorLens(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]protocol.CodeLens, error) {
-	goModArgs, err := source.MarshalArgs(fh.URI())
-	if err != nil {
-		return nil, err
-	}
 	pm, err := snapshot.ParseMod(ctx, fh)
+	if err != nil || pm.File == nil {
+		return nil, err
+	}
+	rng, err := moduleStmtRange(fh, pm)
 	if err != nil {
 		return nil, err
 	}
-	if pm.File == nil || pm.File.Module == nil || pm.File.Module.Syntax == nil {
-		return nil, fmt.Errorf("no parsed go.mod for %s", fh.URI())
-	}
-	rng, err := positionsToRange(pm.Mapper.URI, pm.Mapper, pm.File.Module.Syntax.Start, pm.File.Module.Syntax.End)
+	goModArgs, err := source.MarshalArgs(fh.URI())
 	if err != nil {
 		return nil, err
 	}
@@ -156,20 +129,45 @@ func vendorLens(ctx context.Context, snapshot source.Snapshot, fh source.FileHan
 	}}, nil
 }
 
-func positionsToRange(uri span.URI, m *protocol.ColumnMapper, s, e modfile.Position) (protocol.Range, error) {
-	line, col, err := m.Converter.ToPosition(s.Byte)
+func moduleStmtRange(fh source.FileHandle, pm *source.ParsedModule) (protocol.Range, error) {
+	if pm.File == nil || pm.File.Module == nil || pm.File.Module.Syntax == nil {
+		return protocol.Range{}, fmt.Errorf("no module statement in %s", fh.URI())
+	}
+	syntax := pm.File.Module.Syntax
+	return lineToRange(pm.Mapper, fh.URI(), syntax.Start, syntax.End)
+}
+
+// firstRequireRange returns the range for the first "require" in the given
+// go.mod file. This is either a require block or an individual require line.
+func firstRequireRange(fh source.FileHandle, pm *source.ParsedModule) (protocol.Range, error) {
+	if len(pm.File.Require) == 0 {
+		return protocol.Range{}, fmt.Errorf("no requires in the file %s", fh.URI())
+	}
+	var start, end modfile.Position
+	for _, stmt := range pm.File.Syntax.Stmt {
+		if b, ok := stmt.(*modfile.LineBlock); ok && len(b.Token) == 1 && b.Token[0] == "require" {
+			start, end = b.Span()
+			break
+		}
+	}
+
+	firstRequire := pm.File.Require[0].Syntax
+	if start.Byte == 0 || firstRequire.Start.Byte < start.Byte {
+		start, end = firstRequire.Start, firstRequire.End
+	}
+	return lineToRange(pm.Mapper, fh.URI(), start, end)
+}
+
+func lineToRange(m *protocol.ColumnMapper, uri span.URI, start, end modfile.Position) (protocol.Range, error) {
+	line, col, err := m.Converter.ToPosition(start.Byte)
 	if err != nil {
 		return protocol.Range{}, err
 	}
-	start := span.NewPoint(line, col, s.Byte)
-	line, col, err = m.Converter.ToPosition(e.Byte)
+	s := span.NewPoint(line, col, start.Byte)
+	line, col, err = m.Converter.ToPosition(end.Byte)
 	if err != nil {
 		return protocol.Range{}, err
 	}
-	end := span.NewPoint(line, col, e.Byte)
-	rng, err := m.Range(span.New(uri, start, end))
-	if err != nil {
-		return protocol.Range{}, err
-	}
-	return rng, err
+	e := span.NewPoint(line, col, end.Byte)
+	return m.Range(span.New(uri, s, e))
 }

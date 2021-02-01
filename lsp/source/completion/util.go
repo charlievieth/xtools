@@ -195,10 +195,21 @@ func enclosingSelector(path []ast.Node, pos token.Pos) *ast.SelectorExpr {
 	return nil
 }
 
-func enclosingValueSpec(path []ast.Node) *ast.ValueSpec {
+// enclosingDeclLHS returns LHS idents from containing value spec or
+// assign statement.
+func enclosingDeclLHS(path []ast.Node) []*ast.Ident {
 	for _, n := range path {
-		if vs, ok := n.(*ast.ValueSpec); ok {
-			return vs
+		switch n := n.(type) {
+		case *ast.ValueSpec:
+			return n.Names
+		case *ast.AssignStmt:
+			ids := make([]*ast.Ident, 0, len(n.Lhs))
+			for _, e := range n.Lhs {
+				if id, ok := e.(*ast.Ident); ok {
+					ids = append(ids, id)
+				}
+			}
+			return ids
 		}
 	}
 
@@ -292,4 +303,10 @@ func formatZeroValue(T types.Type, qf types.Qualifier) string {
 	default:
 		return types.TypeString(T, qf) + "{}"
 	}
+}
+
+// isBasicKind returns whether t is a basic type of kind k.
+func isBasicKind(t types.Type, k types.BasicInfo) bool {
+	b, _ := t.Underlying().(*types.Basic)
+	return b != nil && b.Info()&k > 0
 }

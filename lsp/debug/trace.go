@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"runtime/trace"
 	"sort"
 	"strings"
 	"sync"
@@ -21,7 +22,7 @@ import (
 	"github.com/charlievieth/xtools/event/label"
 )
 
-var traceTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var TraceTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}Trace Information{{end}}
 {{define "body"}}
 	{{range .Traces}}<a href="/trace/{{.Name}}">{{.Name}}</a> last: {{.Last.Duration}}, longest: {{.Longest.Duration}}<br>{{end}}
@@ -44,7 +45,7 @@ type traces struct {
 	unfinished map[export.SpanContext]*traceData
 }
 
-type traceResults struct {
+type TraceResults struct { // exported for testing
 	Traces   []*traceSet
 	Selected *traceSet
 }
@@ -73,6 +74,48 @@ type traceEvent struct {
 	Time   time.Time
 	Offset time.Duration
 	Tags   string
+}
+
+func StdTrace(exporter event.Exporter) event.Exporter {
+	return func(ctx context.Context, ev core.Event, lm label.Map) context.Context {
+		span := export.GetSpan(ctx)
+		if span == nil {
+			return exporter(ctx, ev, lm)
+		}
+		switch {
+		case event.IsStart(ev):
+			if span.ParentID.IsValid() {
+				region := trace.StartRegion(ctx, span.Name)
+				ctx = context.WithValue(ctx, traceKey, region)
+			} else {
+				var task *trace.Task
+				ctx, task = trace.NewTask(ctx, span.Name)
+				ctx = context.WithValue(ctx, traceKey, task)
+			}
+			// Log the start event as it may contain useful labels.
+			msg := formatEvent(ctx, ev, lm)
+			trace.Log(ctx, "start", msg)
+		case event.IsLog(ev):
+			category := ""
+			if event.IsError(ev) {
+				category = "error"
+			}
+			msg := formatEvent(ctx, ev, lm)
+			trace.Log(ctx, category, msg)
+		case event.IsEnd(ev):
+			if v := ctx.Value(traceKey); v != nil {
+				v.(interface{ End() }).End()
+			}
+		}
+		return exporter(ctx, ev, lm)
+	}
+}
+
+func formatEvent(ctx context.Context, ev core.Event, lm label.Map) string {
+	buf := &bytes.Buffer{}
+	p := export.Printer{}
+	p.WriteEvent(buf, ev, lm)
+	return buf.String()
 }
 
 func (t *traces) ProcessEvent(ctx context.Context, ev core.Event, lm label.Map) context.Context {
@@ -150,7 +193,7 @@ func (t *traces) getData(req *http.Request) interface{} {
 	if len(t.sets) == 0 {
 		return nil
 	}
-	data := traceResults{}
+	data := TraceResults{}
 	data.Traces = make([]*traceSet, 0, len(t.sets))
 	for _, set := range t.sets {
 		data.Traces = append(data.Traces, set)

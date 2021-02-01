@@ -6,6 +6,7 @@ package regtest
 
 import (
 	"io"
+	"path"
 	"testing"
 
 	"github.com/charlievieth/xtools/lsp/fake"
@@ -146,6 +147,13 @@ func (e *Env) SaveBuffer(name string) {
 	}
 }
 
+func (e *Env) SaveBufferWithoutActions(name string) {
+	e.T.Helper()
+	if err := e.Editor.SaveBufferWithoutActions(e.Ctx, name); err != nil {
+		e.T.Fatal(err)
+	}
+}
+
 // GoToDefinition goes to definition in the editor, calling t.Fatal on any
 // error.
 func (e *Env) GoToDefinition(name string, pos fake.Pos) (string, fake.Pos) {
@@ -242,9 +250,30 @@ func (e *Env) RunGenerate(dir string) {
 // RunGoCommand runs the given command in the sandbox's default working
 // directory.
 func (e *Env) RunGoCommand(verb string, args ...string) {
+	e.T.Helper()
 	if err := e.Sandbox.RunGoCommand(e.Ctx, "", verb, args); err != nil {
 		e.T.Fatal(err)
 	}
+}
+
+// RunGoCommandInDir is like RunGoCommand, but executes in the given
+// relative directory of the sandbox.
+func (e *Env) RunGoCommandInDir(dir, verb string, args ...string) {
+	e.T.Helper()
+	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, verb, args); err != nil {
+		e.T.Fatal(err)
+	}
+}
+
+func (e *Env) DumpGoSum(dir string) {
+	e.T.Helper()
+
+	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, "list", []string{"-mod=mod", "..."}); err != nil {
+		e.T.Fatal(err)
+	}
+	sumFile := path.Join(dir, "/go.sum")
+	e.T.Log("\n\n-- " + sumFile + " --\n" + e.ReadWorkspaceFile(sumFile))
+	e.T.Fatal("see contents above")
 }
 
 // CheckForFileChanges triggers a manual poll of the workspace for any file
@@ -312,6 +341,15 @@ func (e *Env) Completion(path string, pos fake.Pos) *protocol.CompletionList {
 	return completions
 }
 
+// AcceptCompletion accepts a completion for the given item at the given
+// position.
+func (e *Env) AcceptCompletion(path string, pos fake.Pos, item protocol.CompletionItem) {
+	e.T.Helper()
+	if err := e.Editor.AcceptCompletion(e.Ctx, path, pos, item); err != nil {
+		e.T.Fatal(err)
+	}
+}
+
 // CodeAction calls testDocument/codeAction for the given path, and calls
 // t.Fatal if there are errors.
 func (e *Env) CodeAction(path string) []protocol.CodeAction {
@@ -323,7 +361,7 @@ func (e *Env) CodeAction(path string) []protocol.CodeAction {
 	return actions
 }
 
-func (e *Env) changeConfiguration(t *testing.T, config *fake.EditorConfig) {
+func (e *Env) ChangeConfiguration(t *testing.T, config *fake.EditorConfig) {
 	e.Editor.Config = *config
 	if err := e.Editor.Server.DidChangeConfiguration(e.Ctx, &protocol.DidChangeConfigurationParams{
 		// gopls currently ignores the Settings field

@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"log"
+	stdlog "log"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -34,15 +34,19 @@ import (
 	"github.com/charlievieth/xtools/event/keys"
 	"github.com/charlievieth/xtools/event/label"
 	"github.com/charlievieth/xtools/lsp/cache"
+	"github.com/charlievieth/xtools/lsp/debug/log"
 	"github.com/charlievieth/xtools/lsp/debug/tag"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
 	errors "golang.org/x/xerrors"
 )
 
-type instanceKeyType int
+type contextKeyType int
 
-const instanceKey = instanceKeyType(0)
+const (
+	instanceKey contextKeyType = iota
+	traceKey
+)
 
 // An Instance holds all debug information associated with a gopls instance.
 type Instance struct {
@@ -60,7 +64,7 @@ type Instance struct {
 
 	ocagent    *ocagent.Exporter
 	prometheus *prometheus.Exporter
-	rpcs       *rpcs
+	rpcs       *Rpcs
 	traces     *traces
 	State      *State
 }
@@ -177,6 +181,7 @@ type Client struct {
 	Logfile      string
 	GoplsPath    string
 	ServerID     string
+	Service      protocol.Server
 }
 
 // A Server is an outgoing connection to a remote LSP server.
@@ -310,6 +315,16 @@ func (i *Instance) getInfo(r *http.Request) interface{} {
 	return template.HTML(buf.String())
 }
 
+func (i *Instance) AddService(s protocol.Server, session *cache.Session) {
+	for _, c := range i.State.clients {
+		if c.Session == session {
+			c.Service = s
+			return
+		}
+	}
+	stdlog.Printf("unable to find a Client to add the protocol.Server to")
+}
+
 func getMemory(r *http.Request) interface{} {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -345,7 +360,7 @@ func WithInstance(ctx context.Context, workdir, agent string) context.Context {
 	ocConfig.Address = i.OCAgentConfig
 	i.ocagent = ocagent.Connect(ocConfig)
 	i.prometheus = prometheus.New()
-	i.rpcs = &rpcs{}
+	i.rpcs = &Rpcs{}
 	i.traces = &traces{}
 	i.State = &State{}
 	i.exporter = makeInstanceExporter(i)
@@ -373,7 +388,7 @@ func (i *Instance) SetLogFile(logfile string, isDaemon bool) (func(), error) {
 		closeLog = func() {
 			defer f.Close()
 		}
-		log.SetOutput(io.MultiWriter(os.Stderr, f))
+		stdlog.SetOutput(io.MultiWriter(os.Stderr, f))
 		i.LogWriter = f
 	}
 	i.Logfile = logfile
@@ -384,7 +399,7 @@ func (i *Instance) SetLogFile(logfile string, isDaemon bool) (func(), error) {
 // It also logs the port the server starts on, to allow for :0 auto assigned
 // ports.
 func (i *Instance) Serve(ctx context.Context) error {
-	log.SetFlags(log.Lshortfile)
+	stdlog.SetFlags(stdlog.Lshortfile)
 	if i.DebugAddress == "" {
 		return nil
 	}
@@ -396,13 +411,13 @@ func (i *Instance) Serve(ctx context.Context) error {
 
 	port := listener.Addr().(*net.TCPAddr).Port
 	if strings.HasSuffix(i.DebugAddress, ":0") {
-		log.Printf("debug server listening at http://localhost:%d", port)
+		stdlog.Printf("debug server listening at http://localhost:%d", port)
 	}
 	event.Log(ctx, "Debug serving", tag.Port.Of(port))
 	go func() {
 		mux := http.NewServeMux()
-		mux.HandleFunc("/", render(mainTmpl, func(*http.Request) interface{} { return i }))
-		mux.HandleFunc("/debug/", render(debugTmpl, nil))
+		mux.HandleFunc("/", render(MainTmpl, func(*http.Request) interface{} { return i }))
+		mux.HandleFunc("/debug/", render(DebugTmpl, nil))
 		mux.HandleFunc("/debug/pprof/", pprof.Index)
 		mux.HandleFunc("/debug/pprof/cmdline", cmdline)
 		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
@@ -412,19 +427,19 @@ func (i *Instance) Serve(ctx context.Context) error {
 			mux.HandleFunc("/metrics/", i.prometheus.Serve)
 		}
 		if i.rpcs != nil {
-			mux.HandleFunc("/rpc/", render(rpcTmpl, i.rpcs.getData))
+			mux.HandleFunc("/rpc/", render(RPCTmpl, i.rpcs.getData))
 		}
 		if i.traces != nil {
-			mux.HandleFunc("/trace/", render(traceTmpl, i.traces.getData))
+			mux.HandleFunc("/trace/", render(TraceTmpl, i.traces.getData))
 		}
-		mux.HandleFunc("/cache/", render(cacheTmpl, i.getCache))
-		mux.HandleFunc("/session/", render(sessionTmpl, i.getSession))
-		mux.HandleFunc("/view/", render(viewTmpl, i.getView))
-		mux.HandleFunc("/client/", render(clientTmpl, i.getClient))
-		mux.HandleFunc("/server/", render(serverTmpl, i.getServer))
-		mux.HandleFunc("/file/", render(fileTmpl, i.getFile))
-		mux.HandleFunc("/info", render(infoTmpl, i.getInfo))
-		mux.HandleFunc("/memory", render(memoryTmpl, getMemory))
+		mux.HandleFunc("/cache/", render(CacheTmpl, i.getCache))
+		mux.HandleFunc("/session/", render(SessionTmpl, i.getSession))
+		mux.HandleFunc("/view/", render(ViewTmpl, i.getView))
+		mux.HandleFunc("/client/", render(ClientTmpl, i.getClient))
+		mux.HandleFunc("/server/", render(ServerTmpl, i.getServer))
+		mux.HandleFunc("/file/", render(FileTmpl, i.getFile))
+		mux.HandleFunc("/info", render(InfoTmpl, i.getInfo))
+		mux.HandleFunc("/memory", render(MemoryTmpl, getMemory))
 		if err := http.Serve(listener, mux); err != nil {
 			event.Error(ctx, "Debug server failed", err)
 			return
@@ -520,13 +535,29 @@ func makeGlobalExporter(stderr io.Writer) event.Exporter {
 				p.WriteEvent(stderr, ev, lm)
 				pMu.Unlock()
 			}
+			level := log.LabeledLevel(lm)
+			// Exclude trace logs from LSP logs.
+			if level < log.Trace {
+				ctx = protocol.LogEvent(ctx, ev, lm, messageType(level))
+			}
 		}
-		ctx = protocol.LogEvent(ctx, ev, lm)
 		if i == nil {
 			return ctx
 		}
 		return i.exporter(ctx, ev, lm)
 	}
+}
+
+func messageType(l log.Level) protocol.MessageType {
+	switch l {
+	case log.Error:
+		return protocol.Error
+	case log.Warning:
+		return protocol.Warning
+	case log.Debug:
+		return protocol.Log
+	}
+	return protocol.Info
 }
 
 func makeInstanceExporter(i *Instance) event.Exporter {
@@ -573,6 +604,9 @@ func makeInstanceExporter(i *Instance) event.Exporter {
 		}
 		return ctx
 	}
+	// StdTrace must be above export.Spans below (by convention, export
+	// middleware applies its wrapped exporter last).
+	exporter = StdTrace(exporter)
 	metrics := metric.Config{}
 	registerMetrics(&metrics)
 	exporter = metrics.Exporter(exporter)
@@ -616,7 +650,7 @@ func fcontent(v []byte) string {
 	return string(v)
 }
 
-var baseTemplate = template.Must(template.New("").Parse(`
+var BaseTemplate = template.Must(template.New("").Parse(`
 <html>
 <head>
 <title>{{template "title" .}}</title>
@@ -680,9 +714,12 @@ Unknown page
 		}
 		return s
 	},
+	"options": func(s *cache.Session) []string {
+		return showOptions(s.Options())
+	},
 })
 
-var mainTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var MainTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}GoPls server information{{end}}
 {{define "body"}}
 <h2>Caches</h2>
@@ -698,14 +735,14 @@ var mainTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
 {{end}}
 `))
 
-var infoTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var InfoTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}GoPls version information{{end}}
 {{define "body"}}
 {{.}}
 {{end}}
 `))
 
-var memoryTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var MemoryTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}GoPls memory usage{{end}}
 {{define "head"}}<meta http-equiv="refresh" content="5">{{end}}
 {{define "body"}}
@@ -735,14 +772,14 @@ var memoryTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
 {{end}}
 `))
 
-var debugTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var DebugTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}GoPls Debug pages{{end}}
 {{define "body"}}
 <a href="/debug/pprof">Profiling</a>
 {{end}}
 `))
 
-var cacheTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var CacheTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}Cache {{.ID}}{{end}}
 {{define "body"}}
 <h2>memoize.Store entries</h2>
@@ -752,17 +789,40 @@ var cacheTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
 {{end}}
 `))
 
-var clientTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var ClientTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}Client {{.Session.ID}}{{end}}
 {{define "body"}}
 Using session: <b>{{template "sessionlink" .Session.ID}}</b><br>
 {{if .DebugAddress}}Debug this client at: <a href="http://{{localAddress .DebugAddress}}">{{localAddress .DebugAddress}}</a><br>{{end}}
 Logfile: {{.Logfile}}<br>
 Gopls Path: {{.GoplsPath}}<br>
+<h2>Diagnostics</h2>
+{{/*Service: []protocol.Server; each server has map[uri]fileReports;
+	each fileReport: map[diagnosticSoure]diagnosticReport
+	diagnosticSource is one of 5 source
+	diagnosticReport: snapshotID and map[hash]*source.Diagnostic
+	sourceDiagnostic: struct {
+		Range    protocol.Range
+		Message  string
+		Source   string
+		Code     string
+		CodeHref string
+		Severity protocol.DiagnosticSeverity
+		Tags     []protocol.DiagnosticTag
+
+		Related []RelatedInformation
+	}
+	RelatedInformation: struct {
+		URI     span.URI
+		Range   protocol.Range
+		Message string
+	}
+	*/}}
+<ul>{{range $k, $v := .Service.Diagnostics}}<li>{{$k}}:<ol>{{range $v}}<li>{{.}}</li>{{end}}</ol></li>{{end}}</ul>
 {{end}}
 `))
 
-var serverTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var ServerTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}Server {{.ID}}{{end}}
 {{define "body"}}
 {{if .DebugAddress}}Debug this server at: <a href="http://{{localAddress .DebugAddress}}">{{localAddress .DebugAddress}}</a><br>{{end}}
@@ -771,7 +831,7 @@ Gopls Path: {{.GoplsPath}}<br>
 {{end}}
 `))
 
-var sessionTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var SessionTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}Session {{.ID}}{{end}}
 {{define "body"}}
 From: <b>{{template "cachelink" .Cache.ID}}</b><br>
@@ -779,10 +839,12 @@ From: <b>{{template "cachelink" .Cache.ID}}</b><br>
 <ul>{{range .Views}}<li>{{.Name}} is {{template "viewlink" .ID}} in {{.Folder}}</li>{{end}}</ul>
 <h2>Overlays</h2>
 <ul>{{range .Overlays}}<li>{{template "filelink" .}}</li>{{end}}</ul>
+<h2>Options</h2>
+{{range options .}}<p>{{.}}{{end}}
 {{end}}
 `))
 
-var viewTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var ViewTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}View {{.ID}}{{end}}
 {{define "body"}}
 Name: <b>{{.Name}}</b><br>
@@ -793,7 +855,7 @@ From: <b>{{template "sessionlink" .Session.ID}}</b><br>
 {{end}}
 `))
 
-var fileTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var FileTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}Overlay {{.FileIdentity.Hash}}{{end}}
 {{define "body"}}
 {{with .}}

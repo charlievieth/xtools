@@ -388,6 +388,11 @@ type candidate struct {
 	// needs "..." appended.
 	variadic bool
 
+	// convertTo is a type that this candidate should be cast to. For
+	// example, if convertTo is float64, "foo" should be formatted as
+	// "float64(foo)".
+	convertTo types.Type
+
 	// imp is the import that needs to be added to this package in order
 	// for this candidate to be valid. nil if no import needed.
 	imp *importInfo
@@ -431,7 +436,6 @@ func Completion(ctx context.Context, snapshot source.Snapshot, fh source.FileHan
 		if innerErr != nil {
 			// return the error for GetParsedFile since it's more relevant in this situation.
 			return nil, nil, errors.Errorf("getting file for Completion: %w (package completions: %v)", err, innerErr)
-
 		}
 		return items, surrounding, nil
 	}
@@ -699,7 +703,7 @@ func (c *completer) sortItems() {
 		}
 
 		// Then sort by label so order stays consistent. This also has the
-		// effect of prefering shorter candidates.
+		// effect of preferring shorter candidates.
 		return c.items[i].Label < c.items[j].Label
 	})
 }
@@ -729,6 +733,10 @@ func (c *completer) emptySwitchStmt() bool {
 // (i.e. "golang.org/x/"). The user is meant to accept completion suggestions
 // until they reach a complete import path.
 func (c *completer) populateImportCompletions(ctx context.Context, searchImport *ast.ImportSpec) error {
+	if !strings.HasPrefix(searchImport.Path.Value, `"`) {
+		return nil
+	}
+
 	// deepSearch is not valuable for import completions.
 	c.deepState.enabled = false
 
@@ -1003,8 +1011,8 @@ func (c *completer) setSurroundingForComment(comments *ast.CommentGroup) {
 	c.setMatcherFromPrefix(c.surrounding.Prefix())
 }
 
-// isValidIdentifierChar returns true if a byte is a valid go identifier character
-// i.e unicode letter or digit or undescore
+// isValidIdentifierChar returns true if a byte is a valid go identifier
+// character, i.e. unicode letter or digit or underscore.
 func isValidIdentifierChar(char byte) bool {
 	charRune := rune(char)
 	return unicode.In(charRune, unicode.Letter, unicode.Digit) || char == '_'
@@ -1066,6 +1074,19 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 	// Is sel a qualified identifier?
 	if id, ok := sel.X.(*ast.Ident); ok {
 		if pkgName, ok := c.pkg.GetTypesInfo().Uses[id].(*types.PkgName); ok {
+			var pkg source.Package
+			for _, imp := range c.pkg.Imports() {
+				if imp.PkgPath() == pkgName.Imported().Path() {
+					pkg = imp
+				}
+			}
+			// If the package is not imported, try searching for unimported
+			// completions.
+			if pkg == nil && c.opts.unimported {
+				if err := c.unimportedMembers(ctx, id); err != nil {
+					return err
+				}
+			}
 			candidates := c.packageMembers(pkgName.Imported(), stdScore, nil)
 			for _, cand := range candidates {
 				c.deepState.enqueue(cand)
@@ -1280,12 +1301,10 @@ func (c *completer) lexical(ctx context.Context) error {
 				}
 			}
 
-			// Don't use LHS of value spec in RHS.
-			if vs := enclosingValueSpec(c.path); vs != nil {
-				for _, ident := range vs.Names {
-					if obj.Pos() == ident.Pos() {
-						continue Names
-					}
+			// Don't use LHS of decl in RHS.
+			for _, ident := range enclosingDeclLHS(c.path) {
+				if obj.Pos() == ident.Pos() {
+					continue Names
 				}
 			}
 
@@ -1522,6 +1541,7 @@ func (c *completer) structLiteralFieldName(ctx context.Context) error {
 		}
 	}
 
+	deltaScore := 0.0001
 	switch t := clInfo.clType.(type) {
 	case *types.Struct:
 		for i := 0; i < t.NumFields(); i++ {
@@ -1529,7 +1549,7 @@ func (c *completer) structLiteralFieldName(ctx context.Context) error {
 			if !addedFields[field] {
 				c.deepState.enqueue(candidate{
 					obj:   field,
-					score: highScore,
+					score: highScore - float64(i)*deltaScore,
 				})
 			}
 		}
@@ -2491,6 +2511,16 @@ func (ci *candidateInference) candTypeMatches(cand *candidate) bool {
 
 			matches, untyped := ci.typeMatches(expType, candType)
 			if !matches {
+				// If candType doesn't otherwise match, consider if we can
+				// convert candType directly to expType.
+				if considerTypeConversion(candType, expType, cand.path) {
+					cand.convertTo = expType
+					// Give a major score penalty so we always prefer directly
+					// assignable candidates, all else equal.
+					cand.score *= 0.5
+					return true
+				}
+
 				continue
 			}
 
@@ -2502,7 +2532,14 @@ func (ci *candidateInference) candTypeMatches(cand *candidate) bool {
 			// ranking untyped constants above candidates with an exact type
 			// match. Don't lower score of builtin constants, e.g. "true".
 			if untyped && !types.Identical(candType, expType) && cand.obj.Parent() != types.Universe {
-				cand.score /= 2
+				// Bigger penalty for deep completions into other packages to
+				// avoid random constants from other packages popping up all
+				// the time.
+				if len(cand.path) > 0 && isPkgName(cand.path[0]) {
+					cand.score *= 0.5
+				} else {
+					cand.score *= 0.75
+				}
 			}
 
 			return true
@@ -2535,6 +2572,29 @@ func (ci *candidateInference) candTypeMatches(cand *candidate) bool {
 
 		return false
 	})
+}
+
+// considerTypeConversion returns true if we should offer a completion
+// automatically converting "from" to "to".
+func considerTypeConversion(from, to types.Type, path []types.Object) bool {
+	// Don't offer to convert deep completions from other packages.
+	// Otherwise there are many random package level consts/vars that
+	// pop up as candidates all the time.
+	if len(path) > 0 && isPkgName(path[0]) {
+		return false
+	}
+
+	if !types.ConvertibleTo(from, to) {
+		return false
+	}
+
+	// Don't offer to convert ints to strings since that probably
+	// doesn't do what the user wants.
+	if isBasicKind(from, types.IsInteger) && isBasicKind(to, types.IsString) {
+		return false
+	}
+
+	return true
 }
 
 // typeMatches reports whether an object of candType makes a good
