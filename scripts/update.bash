@@ -117,4 +117,6 @@ git add go.mod go.sum
     rm ./gopls
 )
 
-git commit -m "update golang.org/x/tools to $(head -c 8 <<<"$LATEST_SHA")"
+git commit -m "update golang.org/x/tools to $(head -c 8 <<<"$LATEST_SHA")
+
+https://github.com/golang/tools/commit/${LATEST_SHA}"
