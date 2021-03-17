@@ -8,12 +8,13 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	. "github.com/charlievieth/xtools/gopls/regtest"
 
+	"github.com/charlievieth/xtools/lsp/command"
 	"github.com/charlievieth/xtools/lsp/fake"
 	"github.com/charlievieth/xtools/lsp/protocol"
-	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/lsp/tests"
 	"github.com/charlievieth/xtools/testenv"
 )
@@ -52,7 +53,7 @@ const (
 		},
 		{
 			label:        "generate disabled",
-			enabled:      map[string]bool{source.CommandGenerate.Name: false},
+			enabled:      map[string]bool{string(command.Generate): false},
 			wantCodeLens: false,
 		},
 	}
@@ -116,6 +117,14 @@ func main() {
 	_ = hi.Goodbye
 }
 `
+
+	const wantGoMod = `module mod.com
+
+go 1.12
+
+require golang.org/x/hello v1.3.3
+`
+
 	for _, commandTitle := range []string{
 		"Upgrade transitive dependencies",
 		"Upgrade direct dependencies",
@@ -143,19 +152,26 @@ func main() {
 					t.Fatal(err)
 				}
 				env.Await(env.DoneWithChangeWatchedFiles())
-				got := env.Editor.BufferText("go.mod")
-				const wantGoMod = `module mod.com
-
-go 1.12
-
-require golang.org/x/hello v1.3.3
-`
-				if got != wantGoMod {
+				if got := env.Editor.BufferText("go.mod"); got != wantGoMod {
 					t.Fatalf("go.mod upgrade failed:\n%s", tests.Diff(t, wantGoMod, got))
 				}
 			})
 		})
 	}
+	t.Run("Upgrade individual dependency", func(t *testing.T) {
+		WithOptions(ProxyFiles(proxyWithLatest)).Run(t, shouldUpdateDep, func(t *testing.T, env *Env) {
+			env.OpenFile("go.mod")
+			env.ExecuteCodeLensCommand("go.mod", command.CheckUpgrades)
+			d := &protocol.PublishDiagnosticsParams{}
+			env.Await(OnceMet(env.DiagnosticAtRegexpWithMessage("go.mod", `require`, "can be upgraded"),
+				ReadDiagnostics("go.mod", d)))
+			env.ApplyQuickFixes("go.mod", d.Diagnostics)
+			env.Await(env.DoneWithChangeWatchedFiles())
+			if got := env.Editor.BufferText("go.mod"); got != wantGoMod {
+				t.Fatalf("go.mod upgrade failed:\n%s", tests.Diff(t, wantGoMod, got))
+			}
+		})
+	})
 }
 
 func TestUnusedDependenciesCodelens(t *testing.T) {
@@ -203,7 +219,7 @@ func main() {
 `
 	WithOptions(ProxyFiles(proxy)).Run(t, shouldRemoveDep, func(t *testing.T, env *Env) {
 		env.OpenFile("go.mod")
-		env.ExecuteCodeLensCommand("go.mod", source.CommandTidy)
+		env.ExecuteCodeLensCommand("go.mod", command.Tidy)
 		env.Await(env.DoneWithChangeWatchedFiles())
 		got := env.Editor.BufferText("go.mod")
 		const wantGoMod = `module mod.com
@@ -240,22 +256,28 @@ func Foo() {
 }
 `
 	Run(t, workspace, func(t *testing.T, env *Env) {
-		// Open the file. We should have a nonexistant symbol.
+		// Open the file. We have a nonexistant symbol that will break cgo processing.
 		env.OpenFile("cgo.go")
-		env.Await(env.DiagnosticAtRegexp("cgo.go", `C\.(fortytwo)`)) // could not determine kind of name for C.fortytwo
+		env.Await(env.DiagnosticAtRegexpWithMessage("cgo.go", ``, "go list failed to return CompiledGoFiles"))
 
 		// Fix the C function name. We haven't regenerated cgo, so nothing should be fixed.
 		env.RegexpReplace("cgo.go", `int fortythree`, "int fortytwo")
 		env.SaveBuffer("cgo.go")
-		env.Await(env.DiagnosticAtRegexp("cgo.go", `C\.(fortytwo)`))
+		env.Await(OnceMet(
+			env.DoneWithSave(),
+			env.DiagnosticAtRegexpWithMessage("cgo.go", ``, "go list failed to return CompiledGoFiles"),
+		))
 
 		// Regenerate cgo, fixing the diagnostic.
-		env.ExecuteCodeLensCommand("cgo.go", source.CommandRegenerateCgo)
+		env.ExecuteCodeLensCommand("cgo.go", command.RegenerateCgo)
 		env.Await(EmptyDiagnostics("cgo.go"))
 	})
 }
 
 func TestGCDetails(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Flaky test -- see golang.org/issue/44099")
+	}
 	testenv.NeedsGo1Point(t, 15)
 	if runtime.GOOS == "android" {
 		t.Skipf("the gc details code lens doesn't work on Android")
@@ -281,9 +303,11 @@ func main() {
 			CodeLenses: map[string]bool{
 				"gc_details": true,
 			}},
+		// TestGCDetails seems to suffer from poor performance on certain builders. Give it some more time to complete.
+		Timeout(60*time.Second),
 	).Run(t, mod, func(t *testing.T, env *Env) {
 		env.OpenFile("main.go")
-		env.ExecuteCodeLensCommand("main.go", source.CommandToggleDetails)
+		env.ExecuteCodeLensCommand("main.go", command.GCDetails)
 		d := &protocol.PublishDiagnosticsParams{}
 		env.Await(
 			OnceMet(
@@ -316,7 +340,7 @@ func main() {
 		env.Await(DiagnosticAt("main.go", 6, 12))
 
 		// Toggle the GC details code lens again so now it should be off.
-		env.ExecuteCodeLensCommand("main.go", source.CommandToggleDetails)
+		env.ExecuteCodeLensCommand("main.go", command.GCDetails)
 		env.Await(
 			EmptyDiagnostics("main.go"),
 		)

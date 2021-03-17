@@ -133,7 +133,7 @@ func (s *Server) diagnoseChangedFiles(ctx context.Context, snapshot source.Snaps
 		if snapshot.FindFile(uri) == nil {
 			continue
 		}
-		pkgs, err := snapshot.PackagesForFile(ctx, uri, source.TypecheckWorkspace)
+		pkgs, err := snapshot.PackagesForFile(ctx, uri, source.TypecheckFull)
 		if err != nil {
 			// TODO (findleyr): we should probably do something with the error here,
 			// but as of now this can fail repeatedly if load fails, so can be too
@@ -245,41 +245,43 @@ func (s *Server) diagnose(ctx context.Context, snapshot source.Snapshot, forceAn
 func (s *Server) diagnosePkg(ctx context.Context, snapshot source.Snapshot, pkg source.Package, alwaysAnalyze bool) {
 	ctx, done := event.Start(ctx, "Server.diagnosePkg", tag.Snapshot.Of(snapshot.ID()), tag.Package.Of(pkg.ID()))
 	defer done()
+	enableDiagnostics := false
 	includeAnalysis := alwaysAnalyze // only run analyses for packages with open files
-	var gcDetailsDir span.URI        // find the package's optimization details, if available
 	for _, pgf := range pkg.CompiledGoFiles() {
-		if snapshot.IsOpen(pgf.URI) {
-			includeAnalysis = true
+		enableDiagnostics = enableDiagnostics || !snapshot.IgnoredFile(pgf.URI)
+		includeAnalysis = includeAnalysis || snapshot.IsOpen(pgf.URI)
+	}
+	// Don't show any diagnostics on ignored files.
+	if !enableDiagnostics {
+		return
+	}
+
+	pkgDiagnostics, err := snapshot.DiagnosePackage(ctx, pkg)
+	if err != nil {
+		event.Error(ctx, "warning: diagnosing package", err, tag.Snapshot.Of(snapshot.ID()), tag.Package.Of(pkg.ID()))
+		return
+	}
+	for _, cgf := range pkg.CompiledGoFiles() {
+		s.storeDiagnostics(snapshot, cgf.URI, typeCheckSource, pkgDiagnostics[cgf.URI])
+	}
+	if includeAnalysis && !pkg.HasListOrParseErrors() {
+		reports, err := source.Analyze(ctx, snapshot, pkg, false)
+		if err != nil {
+			event.Error(ctx, "warning: analyzing package", err, tag.Snapshot.Of(snapshot.ID()), tag.Package.Of(pkg.ID()))
+			return
 		}
-		if gcDetailsDir == "" {
-			dirURI := span.URIFromPath(filepath.Dir(pgf.URI.Filename()))
-			s.gcOptimizationDetailsMu.Lock()
-			_, ok := s.gcOptimizationDetails[dirURI]
-			s.gcOptimizationDetailsMu.Unlock()
-			if ok {
-				gcDetailsDir = dirURI
-			}
+		for _, cgf := range pkg.CompiledGoFiles() {
+			s.storeDiagnostics(snapshot, cgf.URI, analysisSource, reports[cgf.URI])
 		}
 	}
 
-	typeCheckResults := source.GetTypeCheckDiagnostics(ctx, snapshot, pkg)
-	for uri, diags := range typeCheckResults.Diagnostics {
-		s.storeDiagnostics(snapshot, uri, typeCheckSource, diags)
-	}
-	if includeAnalysis && !typeCheckResults.HasParseOrListErrors {
-		reports, err := source.Analyze(ctx, snapshot, pkg, typeCheckResults)
-		if err != nil {
-			event.Error(ctx, "warning: diagnose package", err, tag.Snapshot.Of(snapshot.ID()), tag.Package.Of(pkg.ID()))
-			return
-		}
-		for uri, diags := range reports {
-			s.storeDiagnostics(snapshot, uri, analysisSource, diags)
-		}
-	}
-	// If gc optimization details are available, add them to the
+	// If gc optimization details are requested, add them to the
 	// diagnostic reports.
-	if gcDetailsDir != "" {
-		gcReports, err := source.GCOptimizationDetails(ctx, snapshot, gcDetailsDir)
+	s.gcOptimizationDetailsMu.Lock()
+	_, enableGCDetails := s.gcOptimizationDetails[pkg.ID()]
+	s.gcOptimizationDetailsMu.Unlock()
+	if enableGCDetails {
+		gcReports, err := source.GCOptimizationDetails(ctx, snapshot, pkg)
 		if err != nil {
 			event.Error(ctx, "warning: gc details", err, tag.Snapshot.Of(snapshot.ID()), tag.Package.Of(pkg.ID()))
 		}
@@ -350,13 +352,11 @@ func (s *Server) showCriticalErrorStatus(ctx context.Context, snapshot source.Sn
 	// status bar.
 	var errMsg string
 	if err != nil {
-		event.Error(ctx, "errors loading workspace", err, tag.Snapshot.Of(snapshot.ID()), tag.Directory.Of(snapshot.View().Folder()))
-
-		// Some error messages can also be displayed as diagnostics.
-		if criticalErr := (*source.CriticalError)(nil); errors.As(err, &criticalErr) {
-			s.storeErrorDiagnostics(ctx, snapshot, modSource, criticalErr.ErrorList)
+		event.Error(ctx, "errors loading workspace", err.MainError, tag.Snapshot.Of(snapshot.ID()), tag.Directory.Of(snapshot.View().Folder()))
+		for _, d := range err.DiagList {
+			s.storeDiagnostics(snapshot, d.URI, modSource, []*source.Diagnostic{d})
 		}
-		errMsg = strings.Replace(err.Error(), "\n", " ", -1)
+		errMsg = strings.Replace(err.MainError.Error(), "\n", " ", -1)
 	}
 
 	if s.criticalErrorStatus == nil {
@@ -403,28 +403,14 @@ func (s *Server) checkForOrphanedFile(ctx context.Context, snapshot source.Snaps
 	// file and show a more specific error message. For now, put the diagnostic
 	// on the package declaration.
 	return &source.Diagnostic{
-		Range: rng,
+		URI:      fh.URI(),
+		Range:    rng,
+		Severity: protocol.SeverityWarning,
+		Source:   source.ListError,
 		Message: fmt.Sprintf(`No packages found for open file %s: %v.
 If this file contains build tags, try adding "-tags=<build tag>" to your gopls "buildFlag" configuration (see (https://github.com/golang/tools/blob/master/gopls/doc/settings.md#buildflags-string).
 Otherwise, see the troubleshooting guidelines for help investigating (https://github.com/golang/tools/blob/master/gopls/doc/troubleshooting.md).
 `, fh.URI().Filename(), err),
-		Severity: protocol.SeverityWarning,
-		Source:   "compiler",
-	}
-}
-
-func (s *Server) storeErrorDiagnostics(ctx context.Context, snapshot source.Snapshot, dsource diagnosticSource, errors []*source.Error) {
-	for _, e := range errors {
-		diagnostic := &source.Diagnostic{
-			Range:    e.Range,
-			Message:  e.Message,
-			Related:  e.Related,
-			Severity: protocol.SeverityError,
-			Source:   e.Category,
-			Code:     e.Code,
-			CodeHref: e.CodeHref,
-		}
-		s.storeDiagnostics(snapshot, e.URI, dsource, []*source.Diagnostic{diagnostic})
 	}
 }
 
@@ -481,7 +467,7 @@ func (s *Server) publishDiagnostics(ctx context.Context, final bool, snapshot so
 			r.snapshotID = snapshot.ID()
 			continue
 		}
-		version := float64(0)
+		var version int32
 		if fh := snapshot.FindFile(uri); fh != nil { // file may have been deleted
 			version = fh.Version()
 		}
@@ -527,7 +513,7 @@ func toProtocolDiagnostics(diagnostics []*source.Diagnostic) []protocol.Diagnost
 			Message:            strings.TrimSpace(diag.Message),
 			Range:              diag.Range,
 			Severity:           diag.Severity,
-			Source:             diag.Source,
+			Source:             string(diag.Source),
 			Tags:               diag.Tags,
 			RelatedInformation: related,
 		}

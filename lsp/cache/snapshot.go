@@ -12,8 +12,10 @@ import (
 	"go/token"
 	"go/types"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +23,7 @@ import (
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
+	"golang.org/x/mod/semver"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/packages"
 	"github.com/charlievieth/xtools/event"
@@ -59,7 +62,7 @@ type snapshot struct {
 	// initializedErr holds the last error resulting from initialization. If
 	// initialization fails, we only retry when the the workspace modules change,
 	// to avoid too many go/packages calls.
-	initializedErr error
+	initializedErr *source.CriticalError
 
 	// mu guards all of the maps in the snapshot.
 	mu sync.Mutex
@@ -103,9 +106,8 @@ type snapshot struct {
 	// Preserve go.mod-related handles to avoid garbage-collecting the results
 	// of various calls to the go command. The handles need not refer to only
 	// the view's go.mod file.
-	modTidyHandles    map[span.URI]*modTidyHandle
-	modUpgradeHandles map[span.URI]*modUpgradeHandle
-	modWhyHandles     map[span.URI]*modWhyHandle
+	modTidyHandles map[span.URI]*modTidyHandle
+	modWhyHandles  map[span.URI]*modWhyHandle
 
 	workspace          *workspace
 	workspaceDirHandle *memoize.Handle
@@ -255,6 +257,44 @@ func (s *snapshot) RunGoCommandPiped(ctx context.Context, mode source.Invocation
 	return s.view.session.gocmdRunner.RunPiped(ctx, *inv, stdout, stderr)
 }
 
+func (s *snapshot) RunGoCommands(ctx context.Context, allowNetwork bool, wd string, run func(invoke func(...string) (*bytes.Buffer, error)) error) (bool, []byte, []byte, error) {
+	var flags source.InvocationFlags
+	if s.workspaceMode()&tempModfile != 0 {
+		flags = source.WriteTemporaryModFile
+	} else {
+		flags = source.Normal
+	}
+	if allowNetwork {
+		flags |= source.AllowNetwork
+	}
+	tmpURI, inv, cleanup, err := s.goCommandInvocation(ctx, flags, &gocommand.Invocation{WorkingDir: wd})
+	if err != nil {
+		return false, nil, nil, err
+	}
+	defer cleanup()
+	invoke := func(args ...string) (*bytes.Buffer, error) {
+		inv.Verb = args[0]
+		inv.Args = args[1:]
+		return s.view.session.gocmdRunner.Run(ctx, *inv)
+	}
+	if err := run(invoke); err != nil {
+		return false, nil, nil, err
+	}
+	if flags.Mode() != source.WriteTemporaryModFile {
+		return false, nil, nil, nil
+	}
+	var modBytes, sumBytes []byte
+	modBytes, err = ioutil.ReadFile(tmpURI.Filename())
+	if err != nil && !os.IsNotExist(err) {
+		return false, nil, nil, err
+	}
+	sumBytes, err = ioutil.ReadFile(strings.TrimSuffix(tmpURI.Filename(), ".mod") + ".sum")
+	if err != nil && !os.IsNotExist(err) {
+		return false, nil, nil, err
+	}
+	return true, modBytes, sumBytes, nil
+}
+
 func (s *snapshot) goCommandInvocation(ctx context.Context, flags source.InvocationFlags, inv *gocommand.Invocation) (tmpURI span.URI, updatedInv *gocommand.Invocation, cleanup func(), err error) {
 	s.view.optionsMu.Lock()
 	allowModfileModificationOption := s.view.options.AllowModfileModifications
@@ -324,11 +364,9 @@ func (s *snapshot) goCommandInvocation(ctx context.Context, flags source.Invocat
 	case source.LoadWorkspace, source.Normal:
 		if vendorEnabled {
 			inv.ModFlag = "vendor"
-		} else if s.workspaceMode()&usesWorkspaceModule == 0 && !allowModfileModificationOption {
+		} else if !allowModfileModificationOption {
 			inv.ModFlag = "readonly"
 		} else {
-			// Temporarily allow updates for multi-module workspace mode:
-			// it doesn't create a go.sum at all. golang/go#42509.
 			inv.ModFlag = mutableModFlag
 		}
 	case source.UpdateUserModFile, source.WriteTemporaryModFile:
@@ -572,12 +610,6 @@ func (s *snapshot) getModWhyHandle(uri span.URI) *modWhyHandle {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.modWhyHandles[uri]
-}
-
-func (s *snapshot) getModUpgradeHandle(uri span.URI) *modUpgradeHandle {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.modUpgradeHandles[uri]
 }
 
 func (s *snapshot) getModTidyHandle(uri span.URI) *modTidyHandle {
@@ -925,10 +957,7 @@ func (s *snapshot) isWorkspacePackage(id packageID) (packagePath, bool) {
 }
 
 func (s *snapshot) FindFile(uri span.URI) source.VersionedFileHandle {
-	f, err := s.view.getFile(uri)
-	if err != nil {
-		return nil
-	}
+	f := s.view.getFile(uri)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -942,10 +971,7 @@ func (s *snapshot) FindFile(uri span.URI) source.VersionedFileHandle {
 // GetVersionedFile succeeds even if the file does not exist. A non-nil error return
 // indicates some type of internal error, for example if ctx is cancelled.
 func (s *snapshot) GetVersionedFile(ctx context.Context, uri span.URI) (source.VersionedFileHandle, error) {
-	f, err := s.view.getFile(uri)
-	if err != nil {
-		return nil, err
-	}
+	f := s.view.getFile(uri)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -997,22 +1023,22 @@ func (s *snapshot) isOpenLocked(uri span.URI) bool {
 }
 
 func (s *snapshot) awaitLoaded(ctx context.Context) error {
-	err := s.awaitLoadedAllErrors(ctx)
+	loadErr := s.awaitLoadedAllErrors(ctx)
 
 	// If we still have absolutely no metadata, check if the view failed to
 	// initialize and return any errors.
 	// TODO(rstambler): Should we clear the error after we return it?
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.metadata) == 0 {
-		return err
+	if len(s.metadata) == 0 && loadErr != nil {
+		return loadErr.MainError
 	}
 	return nil
 }
 
 func (s *snapshot) GetCriticalError(ctx context.Context) *source.CriticalError {
 	loadErr := s.awaitLoadedAllErrors(ctx)
-	if errors.Is(loadErr, context.Canceled) {
+	if loadErr != nil && errors.Is(loadErr.MainError, context.Canceled) {
 		return nil
 	}
 
@@ -1022,7 +1048,7 @@ func (s *snapshot) GetCriticalError(ctx context.Context) *source.CriticalError {
 		wsPkgs, _ := s.WorkspacePackages(ctx)
 		if msg := shouldShowAdHocPackagesWarning(s, wsPkgs); msg != "" {
 			return &source.CriticalError{
-				MainError: fmt.Errorf(msg),
+				MainError: errors.New(msg),
 			}
 		}
 		// Even if workspace packages were returned, there still may be an error
@@ -1035,21 +1061,10 @@ func (s *snapshot) GetCriticalError(ctx context.Context) *source.CriticalError {
 		return nil
 	}
 
-	if strings.Contains(loadErr.Error(), "cannot find main module") {
+	if errMsg := loadErr.MainError.Error(); strings.Contains(errMsg, "cannot find main module") || strings.Contains(errMsg, "go.mod file not found") {
 		return s.workspaceLayoutError(ctx)
 	}
-	criticalErr := &source.CriticalError{
-		MainError: loadErr,
-	}
-	// Attempt to place diagnostics in the relevant go.mod files, if any.
-	for _, uri := range s.ModFiles() {
-		fh, err := s.GetFile(ctx, uri)
-		if err != nil {
-			continue
-		}
-		criticalErr.ErrorList = append(criticalErr.ErrorList, s.extractGoCommandErrors(ctx, s, fh, loadErr.Error())...)
-	}
-	return criticalErr
+	return loadErr
 }
 
 const adHocPackagesWarning = `You are outside of a module and outside of $GOPATH/src.
@@ -1077,19 +1092,27 @@ func containsCommandLineArguments(pkgs []source.Package) bool {
 	return false
 }
 
-func (s *snapshot) awaitLoadedAllErrors(ctx context.Context) error {
+func (s *snapshot) awaitLoadedAllErrors(ctx context.Context) *source.CriticalError {
 	// Do not return results until the snapshot's view has been initialized.
 	s.AwaitInitialized(ctx)
 
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return &source.CriticalError{MainError: ctx.Err()}
 	}
 
 	if err := s.reloadWorkspace(ctx); err != nil {
-		return err
+		diags, _ := s.extractGoCommandErrors(ctx, err.Error())
+		return &source.CriticalError{
+			MainError: err,
+			DiagList:  diags,
+		}
 	}
 	if err := s.reloadOrphanedFiles(ctx); err != nil {
-		return err
+		diags, _ := s.extractGoCommandErrors(ctx, err.Error())
+		return &source.CriticalError{
+			MainError: err,
+			DiagList:  diags,
+		}
 	}
 	// TODO(rstambler): Should we be more careful about returning the
 	// initialization error? Is it possible for the initialization error to be
@@ -1296,7 +1319,6 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]*fileC
 		unloadableFiles:   make(map[span.URI]struct{}),
 		parseModHandles:   make(map[span.URI]*parseModHandle),
 		modTidyHandles:    make(map[span.URI]*modTidyHandle),
-		modUpgradeHandles: make(map[span.URI]*modUpgradeHandle),
 		modWhyHandles:     make(map[span.URI]*modWhyHandle),
 		workspace:         newWorkspace,
 	}
@@ -1340,12 +1362,6 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]*fileC
 			continue
 		}
 		result.modTidyHandles[k] = v
-	}
-	for k, v := range s.modUpgradeHandles {
-		if _, ok := changes[k]; ok {
-			continue
-		}
-		result.modUpgradeHandles[k] = v
 	}
 	for k, v := range s.modWhyHandles {
 		if _, ok := changes[k]; ok {
@@ -1400,16 +1416,11 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]*fileC
 			for k := range s.modTidyHandles {
 				delete(result.modTidyHandles, k)
 			}
-			for k := range s.modUpgradeHandles {
-				delete(result.modUpgradeHandles, k)
-			}
 			for k := range s.modWhyHandles {
 				delete(result.modWhyHandles, k)
 			}
 		}
 		if isGoMod(uri) {
-			// If the view's go.mod file's contents have changed, invalidate
-			// the metadata for every known package in the snapshot.
 			delete(result.parseModHandles, uri)
 		}
 		// Handle the invalidated file; it may have new contents or not exist.
@@ -1529,9 +1540,6 @@ copyIDs:
 
 	// Inherit all of the go.mod-related handles.
 	for _, v := range result.modTidyHandles {
-		newGen.Inherit(v.handle)
-	}
-	for _, v := range result.modUpgradeHandles {
 		newGen.Inherit(v.handle)
 	}
 	for _, v := range result.modWhyHandles {
@@ -1673,7 +1681,36 @@ func (s *snapshot) shouldInvalidateMetadata(ctx context.Context, newSnapshot *sn
 		}
 		return true, false
 	}
+
+	// Re-evaluate build constraints and embed patterns. It would be preferable
+	// to only do this on save, but we don't have the prior versions accessible.
+	oldComments := extractMagicComments(original.File)
+	newComments := extractMagicComments(current.File)
+	if len(oldComments) != len(newComments) {
+		return true, false
+	}
+	for i := range oldComments {
+		if oldComments[i] != newComments[i] {
+			return true, false
+		}
+	}
+
 	return false, false
+}
+
+var buildConstraintOrEmbedRe = regexp.MustCompile(`^//(go:embed|go:build|\s*\+build).*`)
+
+// extractMagicComments finds magic comments that affect metadata in f.
+func extractMagicComments(f *ast.File) []string {
+	var results []string
+	for _, cg := range f.Comments {
+		for _, c := range cg.List {
+			if buildConstraintOrEmbedRe.MatchString(c.Text) {
+				results = append(results, c.Text)
+			}
+		}
+	}
+	return results
 }
 
 func (s *snapshot) BuiltinPackage(ctx context.Context) (*source.BuiltinPackage, error) {
@@ -1741,9 +1778,19 @@ func BuildGoplsMod(ctx context.Context, root span.URI, s source.Snapshot) (*modf
 func buildWorkspaceModFile(ctx context.Context, modFiles map[span.URI]struct{}, fs source.FileSource) (*modfile.File, error) {
 	file := &modfile.File{}
 	file.AddModuleStmt("gopls-workspace")
+	// Track the highest Go version, to be set on the workspace module.
+	// Fall back to 1.12 -- old versions insist on having some version.
+	goVersion := "1.12"
 
 	paths := make(map[string]span.URI)
-	for modURI := range modFiles {
+	var sortedModURIs []span.URI
+	for uri := range modFiles {
+		sortedModURIs = append(sortedModURIs, uri)
+	}
+	sort.Slice(sortedModURIs, func(i, j int) bool {
+		return sortedModURIs[i] < sortedModURIs[j]
+	})
+	for _, modURI := range sortedModURIs {
 		fh, err := fs.GetFile(ctx, modURI)
 		if err != nil {
 			return nil, err
@@ -1759,7 +1806,13 @@ func buildWorkspaceModFile(ctx context.Context, modFiles map[span.URI]struct{}, 
 		if file == nil || parsed.Module == nil {
 			return nil, fmt.Errorf("no module declaration for %s", modURI)
 		}
+		if parsed.Go != nil && semver.Compare(goVersion, parsed.Go.Version) < 0 {
+			goVersion = parsed.Go.Version
+		}
 		path := parsed.Module.Mod.Path
+		if _, ok := paths[path]; ok {
+			return nil, fmt.Errorf("found module %q twice in the workspace", path)
+		}
 		paths[path] = modURI
 		// If the module's path includes a major version, we expect it to have
 		// a matching major version.
@@ -1773,9 +1826,12 @@ func buildWorkspaceModFile(ctx context.Context, modFiles map[span.URI]struct{}, 
 			return nil, err
 		}
 	}
+	if goVersion != "" {
+		file.AddGoStmt(goVersion)
+	}
 	// Go back through all of the modules to handle any of their replace
 	// statements.
-	for modURI := range modFiles {
+	for _, modURI := range sortedModURIs {
 		fh, err := fs.GetFile(ctx, modURI)
 		if err != nil {
 			return nil, err
@@ -1812,6 +1868,7 @@ func buildWorkspaceModFile(ctx context.Context, modFiles map[span.URI]struct{}, 
 			}
 		}
 	}
+	file.SortBlocks()
 	return file, nil
 }
 

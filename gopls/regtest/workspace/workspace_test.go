@@ -5,15 +5,16 @@
 package workspace
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	. "github.com/charlievieth/xtools/gopls/regtest"
 
+	"github.com/charlievieth/xtools/lsp/command"
 	"github.com/charlievieth/xtools/lsp/fake"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/testenv"
@@ -204,7 +205,9 @@ func TestAutomaticWorkspaceModule_Interdependent(t *testing.T) {
 module a.com
 
 require b.com v1.2.3
-
+-- moda/a/go.sum --
+b.com v1.2.3 h1:tXrlXP0rnjRpKNmkbLYoWBdq0ikb3C3bKK9//moAWBI=
+b.com v1.2.3/go.mod h1:D+J7pfFBZK5vdIdZEFquR586vKKIkqG7Qjw9AxG5BQ8=
 -- moda/a/a.go --
 package a
 
@@ -246,7 +249,9 @@ func TestDeleteModule_Interdependent(t *testing.T) {
 module a.com
 
 require b.com v1.2.3
-
+-- moda/a/go.sum --
+b.com v1.2.3 h1:tXrlXP0rnjRpKNmkbLYoWBdq0ikb3C3bKK9//moAWBI=
+b.com v1.2.3/go.mod h1:D+J7pfFBZK5vdIdZEFquR586vKKIkqG7Qjw9AxG5BQ8=
 -- moda/a/a.go --
 package a
 
@@ -284,18 +289,15 @@ func Hello() int {
 		env.Await(
 			env.DoneWithChangeWatchedFiles(),
 		)
-		if testenv.Go1Point() < 14 {
-			// On 1.14 and above, the go mod tidy diagnostics accidentally
-			// download for us. This is the behavior we actually want.
-			d := protocol.PublishDiagnosticsParams{}
-			env.Await(
-				OnceMet(
-					env.DiagnosticAtRegexpWithMessage("moda/a/go.mod", "require b.com v1.2.3", "b.com@v1.2.3"),
-					ReadDiagnostics("moda/a/go.mod", &d),
-				),
-			)
-			env.ApplyQuickFixes("moda/a/go.mod", d.Diagnostics)
-		}
+
+		d := protocol.PublishDiagnosticsParams{}
+		env.Await(
+			OnceMet(
+				env.DiagnosticAtRegexpWithMessage("moda/a/go.mod", "require b.com v1.2.3", "b.com@v1.2.3 has not been downloaded"),
+				ReadDiagnostics("moda/a/go.mod", &d),
+			),
+		)
+		env.ApplyQuickFixes("moda/a/go.mod", d.Diagnostics)
 		got, _ := env.GoToDefinition("moda/a/a.go", env.RegexpSearch("moda/a/a.go", "Hello"))
 		if want := "b.com@v1.2.3/b/b.go"; !strings.HasSuffix(got, want) {
 			t.Errorf("expected %s, got %v", want, got)
@@ -311,7 +313,9 @@ func TestCreateModule_Interdependent(t *testing.T) {
 module a.com
 
 require b.com v1.2.3
-
+-- moda/a/go.sum --
+b.com v1.2.3 h1:tXrlXP0rnjRpKNmkbLYoWBdq0ikb3C3bKK9//moAWBI=
+b.com v1.2.3/go.mod h1:D+J7pfFBZK5vdIdZEFquR586vKKIkqG7Qjw9AxG5BQ8=
 -- moda/a/a.go --
 package a
 
@@ -414,7 +418,9 @@ func TestUseGoplsMod(t *testing.T) {
 module a.com
 
 require b.com v1.2.3
-
+-- moda/a/go.sum --
+b.com v1.2.3 h1:tXrlXP0rnjRpKNmkbLYoWBdq0ikb3C3bKK9//moAWBI=
+b.com v1.2.3/go.mod h1:D+J7pfFBZK5vdIdZEFquR586vKKIkqG7Qjw9AxG5BQ8=
 -- moda/a/a.go --
 package a
 
@@ -430,6 +436,9 @@ func main() {
 module b.com
 
 require example.com v1.2.3
+-- modb/go.sum --
+example.com v1.2.3 h1:Yryq11hF02fEf2JlOS2eph+ICE2/ceevGV3C9dl5V/c=
+example.com v1.2.3/go.mod h1:Y2Rc5rVWjWur0h3pd9aEvK5Pof8YKDANh9gHA2Maujo=
 -- modb/b/b.go --
 package b
 
@@ -477,8 +486,8 @@ replace a.com => $SANDBOX_WORKDIR/moda/a
 		env.WriteWorkspaceFile("gopls.mod", fmt.Sprintf(`module gopls-workspace
 
 require (
-	a.com v0.0.0-goplsworkspace
-	b.com v0.0.0-goplsworkspace
+	a.com v1.9999999.0-goplsworkspace
+	b.com v1.9999999.0-goplsworkspace
 )
 
 replace a.com => %s/moda/a
@@ -493,7 +502,7 @@ replace b.com => %s/modb
 		var d protocol.PublishDiagnosticsParams
 		env.Await(
 			OnceMet(
-				env.DiagnosticAtRegexp("modb/go.mod", `require example.com v1.2.3`),
+				env.DiagnosticAtRegexpWithMessage("modb/go.mod", `require example.com v1.2.3`, "has not been downloaded"),
 				ReadDiagnostics("modb/go.mod", &d),
 			),
 		)
@@ -639,16 +648,25 @@ func main() {
 		Modes(Experimental),
 		SendPID(),
 	).Run(t, multiModule, func(t *testing.T, env *Env) {
-		pid := os.Getpid()
+		params := &protocol.ExecuteCommandParams{
+			Command:   command.WorkspaceMetadata.ID(),
+			Arguments: []json.RawMessage{json.RawMessage("{}")},
+		}
+		var result command.WorkspaceMetadataResult
+		env.ExecuteCommand(params, &result)
+
+		if n := len(result.Workspaces); n != 1 {
+			env.T.Fatalf("got %d workspaces, want 1", n)
+		}
 		// Don't factor this out of Server.addFolders. vscode-go expects this
 		// directory.
-		modPath := filepath.Join(os.TempDir(), fmt.Sprintf("gopls-%d.workspace", pid), "go.mod")
+		modPath := filepath.Join(result.Workspaces[0].ModuleDir, "go.mod")
 		gotb, err := ioutil.ReadFile(modPath)
 		if err != nil {
 			t.Fatalf("reading expected workspace modfile: %v", err)
 		}
 		got := string(gotb)
-		for _, want := range []string{"a.com v0.0.0-goplsworkspace", "b.com v0.0.0-goplsworkspace"} {
+		for _, want := range []string{"a.com v1.9999999.0-goplsworkspace", "b.com v1.9999999.0-goplsworkspace"} {
 			if !strings.Contains(got, want) {
 				// want before got here, since the go.mod is multi-line
 				t.Fatalf("workspace go.mod missing %q. got:\n%s", want, got)
@@ -659,7 +677,7 @@ func main() {
 				module gopls-workspace
 
 				require (
-					a.com v0.0.0-goplsworkspace
+					a.com v1.9999999.0-goplsworkspace
 				)
 
 				replace a.com => %s/moda/a
@@ -670,7 +688,7 @@ func main() {
 			t.Fatalf("reading expected workspace modfile: %v", err)
 		}
 		got = string(gotb)
-		want := "b.com v0.0.0-goplsworkspace"
+		want := "b.com v1.9999999.0-goplsworkspace"
 		if strings.Contains(got, want) {
 			t.Fatalf("workspace go.mod contains unexpected %q. got:\n%s", want, got)
 		}
@@ -772,5 +790,63 @@ package exclude
 	}
 	WithOptions(cfg, Modes(Experimental), ProxyFiles(proxy)).Run(t, files, func(t *testing.T, env *Env) {
 		env.Await(env.DiagnosticAtRegexp("include/include.go", `exclude.(X)`))
+	})
+}
+
+// Confirm that a fix for a tidy module will correct all modules in the
+// workspace.
+func TestMultiModule_OneBrokenModule(t *testing.T) {
+	testenv.NeedsGo1Point(t, 15)
+
+	const mod = `
+-- a/go.mod --
+module a.com
+
+go 1.12
+-- a/main.go --
+package main
+-- b/go.mod --
+module b.com
+
+go 1.12
+
+require (
+	example.com v1.2.3
+)
+-- b/go.sum --
+-- b/main.go --
+package b
+
+import "example.com/blah"
+
+func main() {
+	blah.Hello()
+}
+`
+	WithOptions(
+		ProxyFiles(workspaceProxy),
+		Modes(Experimental),
+	).Run(t, mod, func(t *testing.T, env *Env) {
+		params := &protocol.PublishDiagnosticsParams{}
+		env.OpenFile("b/go.mod")
+		env.Await(
+			OnceMet(
+				env.GoSumDiagnostic("b/go.mod", `example.com v1.2.3`),
+				ReadDiagnostics("b/go.mod", params),
+			),
+		)
+		for _, d := range params.Diagnostics {
+			if !strings.Contains(d.Message, "go.sum is out of sync") {
+				continue
+			}
+			actions := env.GetQuickFixes("b/go.mod", []protocol.Diagnostic{d})
+			if len(actions) != 2 {
+				t.Fatalf("expected 2 code actions, got %v", len(actions))
+			}
+			env.ApplyQuickFixes("b/go.mod", []protocol.Diagnostic{d})
+		}
+		env.Await(
+			EmptyDiagnostics("b/go.mod"),
+		)
 	})
 }

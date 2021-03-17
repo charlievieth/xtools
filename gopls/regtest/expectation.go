@@ -12,6 +12,7 @@ import (
 	"github.com/charlievieth/xtools/lsp"
 	"github.com/charlievieth/xtools/lsp/fake"
 	"github.com/charlievieth/xtools/lsp/protocol"
+	"github.com/charlievieth/xtools/testenv"
 )
 
 // An Expectation asserts that the state of the editor at a point in time
@@ -442,7 +443,7 @@ func (e DiagnosticExpectation) Check(s State) Verdict {
 	found := false
 	for _, d := range diags.Diagnostics {
 		if e.pos != nil {
-			if d.Range.Start.Line != float64(e.pos.Line) || d.Range.Start.Character != float64(e.pos.Column) {
+			if d.Range.Start.Line != uint32(e.pos.Line) || d.Range.Start.Character != uint32(e.pos.Column) {
 				continue
 			}
 		}
@@ -519,7 +520,7 @@ func (e *Env) AnyDiagnosticAtCurrentVersion(name string) Expectation {
 	version := e.Editor.BufferVersion(name)
 	check := func(s State) Verdict {
 		diags, ok := s.diagnostics[name]
-		if ok && diags.Version == float64(version) {
+		if ok && diags.Version == int32(version) {
 			return Met
 		}
 		return Unmet
@@ -579,4 +580,17 @@ func NoDiagnosticAt(name string, line, col int) DiagnosticExpectation {
 // otherwise it may always succeed.
 func NoDiagnosticWithMessage(name, msg string) DiagnosticExpectation {
 	return DiagnosticExpectation{path: name, message: msg, present: false}
+}
+
+// GoSum asserts that a "go.sum is out of sync" diagnostic for the given module
+// (as formatted in a go.mod file, e.g. "example.com v1.0.0") is present.
+func (e *Env) GoSumDiagnostic(name, module string) Expectation {
+	e.T.Helper()
+	// In 1.16, go.sum diagnostics should appear on the relevant module. Earlier
+	// errors have no information and appear on the module declaration.
+	if testenv.Go1Point() >= 16 {
+		return e.DiagnosticAtRegexpWithMessage(name, module, "go.sum is out of sync")
+	} else {
+		return e.DiagnosticAtRegexpWithMessage(name, `module`, "go.sum is out of sync")
+	}
 }

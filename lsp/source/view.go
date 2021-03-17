@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"go/ast"
+	"go/scanner"
 	"go/token"
 	"go/types"
 	"io"
@@ -83,8 +84,12 @@ type Snapshot interface {
 	// string for the objects.
 	PosToDecl(ctx context.Context, pgf *ParsedGoFile) (map[token.Pos]ast.Decl, error)
 
+	// DiagnosePackage returns basic diagnostics, including list, parse, and type errors
+	// for pkg, grouped by file.
+	DiagnosePackage(ctx context.Context, pkg Package) (map[span.URI][]*Diagnostic, error)
+
 	// Analyze runs the analyses for the given package at this snapshot.
-	Analyze(ctx context.Context, pkgID string, analyzers ...*analysis.Analyzer) ([]*Error, error)
+	Analyze(ctx context.Context, pkgID string, analyzers []*Analyzer) ([]*Diagnostic, error)
 
 	// RunGoCommandPiped runs the given `go` command, writing its output
 	// to stdout and stderr. Verb, Args, and WorkingDir must be specified.
@@ -93,6 +98,10 @@ type Snapshot interface {
 	// RunGoCommandDirect runs the given `go` command. Verb, Args, and
 	// WorkingDir must be specified.
 	RunGoCommandDirect(ctx context.Context, mode InvocationFlags, inv *gocommand.Invocation) (*bytes.Buffer, error)
+
+	// RunGoCommands runs a series of `go` commands that updates the go.mod
+	// and go.sum file for wd, and returns their updated contents.
+	RunGoCommands(ctx context.Context, allowNetwork bool, wd string, run func(invoke func(...string) (*bytes.Buffer, error)) error) (bool, []byte, []byte, error)
 
 	// RunProcessEnvFunc runs fn with the process env for this snapshot's view.
 	// Note: the process env contains cached module and filesystem state.
@@ -108,10 +117,6 @@ type Snapshot interface {
 	// ModWhy returns the results of `go mod why` for the module specified by
 	// the given go.mod file.
 	ModWhy(ctx context.Context, fh FileHandle) (map[string]string, error)
-
-	// ModUpgrade returns the possible updates for the module specified by the
-	// given go.mod file.
-	ModUpgrade(ctx context.Context, fh FileHandle) (map[string]string, error)
 
 	// ModTidy returns the results of `go mod tidy` for the module specified by
 	// the given go.mod file.
@@ -189,7 +194,7 @@ const (
 
 	// AllowNetwork is a flag bit that indicates the invocation should be
 	// allowed to access the network.
-	AllowNetwork = 1 << 10
+	AllowNetwork InvocationFlags = 1 << 10
 )
 
 func (m InvocationFlags) Mode() InvocationFlags {
@@ -209,6 +214,10 @@ type View interface {
 
 	// Folder returns the folder with which this view was created.
 	Folder() span.URI
+
+	// TempWorkspace returns the folder this view uses for its temporary
+	// workspace module.
+	TempWorkspace() span.URI
 
 	// Shutdown closes this view, and detaches it from its session.
 	Shutdown(ctx context.Context)
@@ -231,6 +240,12 @@ type View interface {
 	// IsGoPrivatePath reports whether target is a private import path, as identified
 	// by the GOPRIVATE environment variable.
 	IsGoPrivatePath(path string) bool
+
+	// ModuleUpgrades returns known module upgrades.
+	ModuleUpgrades() map[string]string
+
+	// RegisterModuleUpgrades registers that upgrades exist for the given modules.
+	RegisterModuleUpgrades(upgrades map[string]string)
 }
 
 // A FileSource maps uris to FileHandles. This abstraction exists both for
@@ -256,7 +271,7 @@ type ParsedGoFile struct {
 	// actual content of the file if we have fixed the AST.
 	Src      []byte
 	Mapper   *protocol.ColumnMapper
-	ParseErr error
+	ParseErr scanner.ErrorList
 }
 
 // A ParsedModule contains the results of parsing a go.mod file.
@@ -264,13 +279,13 @@ type ParsedModule struct {
 	URI         span.URI
 	File        *modfile.File
 	Mapper      *protocol.ColumnMapper
-	ParseErrors []*Error
+	ParseErrors []*Diagnostic
 }
 
 // A TidiedModule contains the results of running `go mod tidy` on a module.
 type TidiedModule struct {
 	// Diagnostics representing changes made by `go mod tidy`.
-	Errors []*Error
+	Diagnostics []*Diagnostic
 	// The bytes of the go.mod file after it was tidied.
 	TidiedContent []byte
 }
@@ -280,8 +295,13 @@ type TidiedModule struct {
 // of the client.
 // A session may have many active views at any given time.
 type Session interface {
-	// NewView creates a new View, returning it and its first snapshot.
-	NewView(ctx context.Context, name string, folder, tempWorkspaceDir span.URI, options *Options) (View, Snapshot, func(), error)
+	// ID returns the unique identifier for this session on this server.
+	ID() string
+	// NewView creates a new View, returning it and its first snapshot. If a
+	// non-empty tempWorkspace directory is provided, the View will record a copy
+	// of its gopls workspace module in that directory, so that client tooling
+	// can execute in the same main module.
+	NewView(ctx context.Context, name string, folder, tempWorkspace span.URI, options *Options) (View, Snapshot, func(), error)
 
 	// Cache returns the cache that created this session, for debugging only.
 	Cache() interface{}
@@ -342,7 +362,7 @@ type FileModification struct {
 
 	// Version will be -1 and Text will be nil when they are not supplied,
 	// specifically on textDocument/didClose and for on-disk changes.
-	Version float64
+	Version int32
 	Text    []byte
 
 	// LanguageID is only sent from the language client on textDocument/didOpen.
@@ -429,7 +449,7 @@ const (
 
 type VersionedFileHandle interface {
 	FileHandle
-	Version() float64
+	Version() int32
 	Session() string
 
 	// LSPIdentity returns the version identity of a file.
@@ -444,7 +464,7 @@ type VersionedFileIdentity struct {
 
 	// Version is the version of the file, as specified by the client. It should
 	// only be set in combination with SessionID.
-	Version float64
+	Version int32
 }
 
 // FileHandle represents a handle to a specific version of a single file.
@@ -503,20 +523,15 @@ type Analyzer struct {
 	// the value of the Staticcheck setting overrides this field.
 	Enabled bool
 
-	// Command is the name of the command used to invoke the suggested fixes
-	// for the analyzer. It is non-nil if we expect this analyzer to provide
-	// its fix separately from its diagnostics. That is, we should apply the
-	// analyzer's suggested fixes through a Command, not a TextEdit.
-	Command *Command
+	// Fix is the name of the suggested fix name used to invoke the suggested
+	// fixes for the analyzer. It is non-empty if we expect this analyzer to
+	// provide its fix separately from its diagnostics. That is, we should apply
+	// the analyzer's suggested fixes through a Command, not a TextEdit.
+	Fix string
 
-	// If this is true, then we can apply the suggested fixes
-	// as part of a source.FixAll codeaction.
-	HighConfidence bool
-
-	// FixesError is only set for type-error analyzers.
-	// It reports true if the message provided indicates an error that could be
-	// fixed by the analyzer.
-	FixesError func(msg string) bool
+	// ActionKind is the kind of code action this analyzer produces. If
+	// unspecified the type defaults to quickfix.
+	ActionKind protocol.CodeActionKind
 }
 
 func (a Analyzer) IsEnabled(view View) bool {
@@ -541,7 +556,6 @@ type Package interface {
 	CompiledGoFiles() []*ParsedGoFile
 	File(uri span.URI) (*ParsedGoFile, error)
 	GetSyntax() []*ast.File
-	GetErrors() []*Error
 	GetTypes() *types.Package
 	GetTypesInfo() *types.Info
 	GetTypesSizes() types.Sizes
@@ -551,58 +565,55 @@ type Package interface {
 	MissingDependencies() []string
 	Imports() []Package
 	Version() *module.Version
+	HasListOrParseErrors() bool
+	HasTypeErrors() bool
 }
 
 type CriticalError struct {
+	// MainError is the primary error. Must be non-nil.
 	MainError error
-	ErrorList []*Error
+	// DiagList contains any supplemental (structured) diagnostics.
+	DiagList []*Diagnostic
 }
 
-func (err *CriticalError) Error() string {
-	if err.MainError == nil {
-		return ""
-	}
-	return err.MainError.Error()
-}
-
-// An Error corresponds to an LSP Diagnostic.
+// An Diagnostic corresponds to an LSP Diagnostic.
 // https://microsoft.github.io/language-server-protocol/specification#diagnostic
-type Error struct {
+type Diagnostic struct {
 	URI      span.URI
 	Range    protocol.Range
-	Kind     ErrorKind
-	Message  string
-	Category string // only used by analysis errors so far
-
-	Related []RelatedInformation
-
+	Severity protocol.DiagnosticSeverity
 	Code     string
 	CodeHref string
 
-	// SuggestedFixes is used to generate quick fixes for a CodeAction request.
-	// It isn't part of the Diagnostic type.
+	// Source is a human-readable description of the source of the error.
+	// Diagnostics generated by an analysis.Analyzer set it to Analyzer.Name.
+	Source DiagnosticSource
+
+	Message string
+
+	Tags    []protocol.DiagnosticTag
+	Related []RelatedInformation
+
+	// Fields below are used internally to generate quick fixes. They aren't
+	// part of the LSP spec and don't leave the server.
 	SuggestedFixes []SuggestedFix
+	Analyzer       *Analyzer
 }
 
-// GoModTidy is the source for a diagnostic computed by running `go mod tidy`.
-const GoModTidy = "go mod tidy"
-
-type ErrorKind int
+type DiagnosticSource string
 
 const (
-	UnknownError = ErrorKind(iota)
-	ListError
-	ParseError
-	TypeError
-	ModTidyError
-	Analysis
+	UnknownError             DiagnosticSource = "<Unknown source>"
+	ListError                DiagnosticSource = "go list"
+	ParseError               DiagnosticSource = "syntax"
+	TypeError                DiagnosticSource = "compiler"
+	ModTidyError             DiagnosticSource = "go mod tidy"
+	OptimizationDetailsError DiagnosticSource = "optimizer details"
+	UpgradeNotification      DiagnosticSource = "upgrade available"
 )
 
-func (e *Error) Error() string {
-	if e.URI == "" {
-		return e.Message
-	}
-	return fmt.Sprintf("%s:%s: %s", e.URI, e.Range, e.Message)
+func AnalyzerErrorKind(name string) DiagnosticSource {
+	return DiagnosticSource(name)
 }
 
 var (
@@ -614,12 +625,22 @@ var (
 // sure not to show this version to end users in error messages, to avoid
 // confusion.
 // The major version is not included, as that depends on the module path.
-const workspaceModuleVersion = ".0.0-goplsworkspace"
+//
+// If workspace module A is dependent on workspace module B, we need our
+// nonexistant version to be greater than the version A mentions.
+// Otherwise, the go command will try to update to that version. Use a very
+// high minor version to make that more likely.
+const workspaceModuleVersion = ".9999999.0-goplsworkspace"
 
 func IsWorkspaceModuleVersion(version string) bool {
 	return strings.HasSuffix(version, workspaceModuleVersion)
 }
 
 func WorkspaceModuleVersion(majorVersion string) string {
+	// Use the highest compatible major version to avoid unwanted upgrades.
+	// See the comment on workspaceModuleVersion.
+	if majorVersion == "v0" {
+		majorVersion = "v1"
+	}
 	return majorVersion + workspaceModuleVersion
 }

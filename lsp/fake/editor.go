@@ -15,8 +15,8 @@ import (
 	"sync"
 
 	"github.com/charlievieth/xtools/jsonrpc2"
+	"github.com/charlievieth/xtools/lsp/command"
 	"github.com/charlievieth/xtools/lsp/protocol"
-	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/span"
 	errors "golang.org/x/xerrors"
 )
@@ -57,12 +57,12 @@ type CallCounts struct {
 type buffer struct {
 	version int
 	path    string
-	content []string
+	lines   []string
 	dirty   bool
 }
 
 func (b buffer) text() string {
-	return strings.Join(b.content, "\n")
+	return strings.Join(b.lines, "\n")
 }
 
 // EditorConfig configures the editor's LSP session. This is similar to
@@ -109,6 +109,8 @@ type EditorConfig struct {
 	DirectoryFilters []string
 
 	VerboseOutput bool
+
+	ImportShortcut string
 }
 
 // NewEditor Creates a new Editor.
@@ -238,6 +240,10 @@ func (e *Editor) configuration() map[string]interface{} {
 		config["verboseOutput"] = true
 	}
 
+	if e.Config.ImportShortcut != "" {
+		config["importShortcut"] = e.Config.ImportShortcut
+	}
+
 	// TODO(rFindley): change to the new settings name once it is no longer
 	// designated experimental.
 	config["experimentalDiagnosticsDelay"] = "10ms"
@@ -266,7 +272,7 @@ func (e *Editor) initialize(ctx context.Context, workspaceFolders []string) erro
 	// TODO: set client capabilities
 	params.InitializationOptions = e.configuration()
 	if e.Config.SendPID {
-		params.ProcessID = float64(os.Getpid())
+		params.ProcessID = int32(os.Getpid())
 	}
 
 	// This is a bit of a hack, since the fake editor doesn't actually support
@@ -328,6 +334,10 @@ func (e *Editor) onFileChanges(ctx context.Context, evts []FileEvent) {
 				if err != nil {
 					continue // A race with some other operation.
 				}
+				// No need to update if the buffer content hasn't changed.
+				if content == strings.Join(buf.lines, "\n") {
+					continue
+				}
 				// During shutdown, this call will fail. Ignore the error.
 				_ = e.setBufferContentLocked(ctx, evt.Path, false, strings.Split(content, "\n"), nil)
 			}
@@ -357,7 +367,7 @@ func textDocumentItem(wd *Workdir, buf buffer) protocol.TextDocumentItem {
 	return protocol.TextDocumentItem{
 		URI:        uri,
 		LanguageID: languageID,
-		Version:    float64(buf.version),
+		Version:    int32(buf.version),
 		Text:       buf.text(),
 	}
 }
@@ -372,7 +382,7 @@ func (e *Editor) createBuffer(ctx context.Context, path string, dirty bool, cont
 	buf := buffer{
 		version: 1,
 		path:    path,
-		content: strings.Split(content, "\n"),
+		lines:   strings.Split(content, "\n"),
 		dirty:   dirty,
 	}
 	e.mu.Lock()
@@ -467,10 +477,7 @@ func (e *Editor) SaveBufferWithoutActions(ctx context.Context, path string) erro
 
 	if e.Server != nil {
 		params := &protocol.DidSaveTextDocumentParams{
-			TextDocument: protocol.VersionedTextDocumentIdentifier{
-				Version:                float64(buf.version),
-				TextDocumentIdentifier: docID,
-			},
+			TextDocument: docID,
 		}
 		if includeText {
 			params.Text = &content
@@ -637,8 +644,8 @@ func (e *Editor) editBufferLocked(ctx context.Context, path string, edits []Edit
 	if !ok {
 		return fmt.Errorf("unknown buffer %q", path)
 	}
-	content := make([]string, len(buf.content))
-	copy(content, buf.content)
+	content := make([]string, len(buf.lines))
+	copy(content, buf.lines)
 	content, err := editContent(content, edits)
 	if err != nil {
 		return err
@@ -651,7 +658,7 @@ func (e *Editor) setBufferContentLocked(ctx context.Context, path string, dirty 
 	if !ok {
 		return fmt.Errorf("unknown buffer %q", path)
 	}
-	buf.content = content
+	buf.lines = content
 	buf.version++
 	buf.dirty = dirty
 	e.buffers[path] = buf
@@ -667,7 +674,7 @@ func (e *Editor) setBufferContentLocked(ctx context.Context, path string, dirty 
 	}
 	params := &protocol.DidChangeTextDocumentParams{
 		TextDocument: protocol.VersionedTextDocumentIdentifier{
-			Version:                float64(buf.version),
+			Version:                int32(buf.version),
 			TextDocumentIdentifier: e.textDocumentIdentifier(buf.path),
 		},
 		ContentChanges: evts,
@@ -744,39 +751,42 @@ func (e *Editor) Symbol(ctx context.Context, query string) ([]SymbolInformation,
 
 // OrganizeImports requests and performs the source.organizeImports codeAction.
 func (e *Editor) OrganizeImports(ctx context.Context, path string) error {
-	return e.codeAction(ctx, path, nil, nil, protocol.SourceOrganizeImports)
+	_, err := e.codeAction(ctx, path, nil, nil, protocol.SourceOrganizeImports)
+	return err
 }
 
 // RefactorRewrite requests and performs the source.refactorRewrite codeAction.
 func (e *Editor) RefactorRewrite(ctx context.Context, path string, rng *protocol.Range) error {
-	return e.codeAction(ctx, path, rng, nil, protocol.RefactorRewrite)
+	applied, err := e.codeAction(ctx, path, rng, nil, protocol.RefactorRewrite)
+	if applied == 0 {
+		return errors.Errorf("no refactorings were applied")
+	}
+	return err
 }
 
 // ApplyQuickFixes requests and performs the quickfix codeAction.
 func (e *Editor) ApplyQuickFixes(ctx context.Context, path string, rng *protocol.Range, diagnostics []protocol.Diagnostic) error {
-	return e.codeAction(ctx, path, rng, diagnostics, protocol.QuickFix, protocol.SourceFixAll)
+	applied, err := e.codeAction(ctx, path, rng, diagnostics, protocol.QuickFix, protocol.SourceFixAll)
+	if applied == 0 {
+		return errors.Errorf("no quick fixes were applied")
+	}
+	return err
 }
 
-func (e *Editor) codeAction(ctx context.Context, path string, rng *protocol.Range, diagnostics []protocol.Diagnostic, only ...protocol.CodeActionKind) error {
-	if e.Server == nil {
-		return nil
-	}
-	params := &protocol.CodeActionParams{}
-	params.TextDocument.URI = e.sandbox.Workdir.URI(path)
-	params.Context.Only = only
-	if diagnostics != nil {
-		params.Context.Diagnostics = diagnostics
-	}
-	if rng != nil {
-		params.Range = *rng
-	}
-	actions, err := e.Server.CodeAction(ctx, params)
+// GetQuickFixes returns the available quick fix code actions.
+func (e *Editor) GetQuickFixes(ctx context.Context, path string, rng *protocol.Range, diagnostics []protocol.Diagnostic) ([]protocol.CodeAction, error) {
+	return e.getCodeActions(ctx, path, rng, diagnostics, protocol.QuickFix, protocol.SourceFixAll)
+}
+
+func (e *Editor) codeAction(ctx context.Context, path string, rng *protocol.Range, diagnostics []protocol.Diagnostic, only ...protocol.CodeActionKind) (int, error) {
+	actions, err := e.getCodeActions(ctx, path, rng, diagnostics, only...)
 	if err != nil {
-		return errors.Errorf("textDocument/codeAction: %w", err)
+		return 0, err
 	}
+	applied := 0
 	for _, action := range actions {
 		if action.Title == "" {
-			return errors.Errorf("empty title for code action")
+			return 0, errors.Errorf("empty title for code action")
 		}
 		var match bool
 		for _, o := range only {
@@ -788,15 +798,16 @@ func (e *Editor) codeAction(ctx context.Context, path string, rng *protocol.Rang
 		if !match {
 			continue
 		}
+		applied++
 		for _, change := range action.Edit.DocumentChanges {
 			path := e.sandbox.Workdir.URIToPath(change.TextDocument.URI)
-			if float64(e.buffers[path].version) != change.TextDocument.Version {
+			if int32(e.buffers[path].version) != change.TextDocument.Version {
 				// Skip edits for old versions.
 				continue
 			}
 			edits := convertEdits(change.Edits)
 			if err := e.EditBuffer(ctx, path, edits); err != nil {
-				return errors.Errorf("editing buffer %q: %w", path, err)
+				return 0, errors.Errorf("editing buffer %q: %w", path, err)
 			}
 		}
 		// Execute any commands. The specification says that commands are
@@ -806,15 +817,31 @@ func (e *Editor) codeAction(ctx context.Context, path string, rng *protocol.Rang
 				Command:   action.Command.Command,
 				Arguments: action.Command.Arguments,
 			}); err != nil {
-				return err
+				return 0, err
 			}
 		}
 		// Some commands may edit files on disk.
 		if err := e.sandbox.Workdir.CheckForFileChanges(ctx); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return applied, nil
+}
+
+func (e *Editor) getCodeActions(ctx context.Context, path string, rng *protocol.Range, diagnostics []protocol.Diagnostic, only ...protocol.CodeActionKind) ([]protocol.CodeAction, error) {
+	if e.Server == nil {
+		return nil, nil
+	}
+	params := &protocol.CodeActionParams{}
+	params.TextDocument.URI = e.sandbox.Workdir.URI(path)
+	params.Context.Only = only
+	if diagnostics != nil {
+		params.Context.Diagnostics = diagnostics
+	}
+	if rng != nil {
+		params.Range = *rng
+	}
+	return e.Server.CodeAction(ctx, params)
 }
 
 func (e *Editor) ExecuteCommand(ctx context.Context, params *protocol.ExecuteCommandParams) (interface{}, error) {
@@ -885,7 +912,7 @@ func (e *Editor) checkBufferPosition(path string, pos Pos) error {
 	if !ok {
 		return fmt.Errorf("buffer %q is not open", path)
 	}
-	if !inText(pos, buf.content) {
+	if !inText(pos, buf.lines) {
 		return fmt.Errorf("position %v is invalid in buffer %q", pos, path)
 	}
 	return nil
@@ -895,18 +922,22 @@ func (e *Editor) checkBufferPosition(path string, pos Pos) error {
 // path. It does not report any resulting file changes as a watched file
 // change, so must be followed by a call to Workdir.CheckForFileChanges once
 // the generate command has completed.
+// TODO(rFindley): this shouldn't be necessary anymore. Delete it.
 func (e *Editor) RunGenerate(ctx context.Context, dir string) error {
 	if e.Server == nil {
 		return nil
 	}
 	absDir := e.sandbox.Workdir.AbsPath(dir)
-	jsonArgs, err := source.MarshalArgs(span.URIFromPath(absDir), false)
+	cmd, err := command.NewGenerateCommand("", command.GenerateArgs{
+		Dir:       protocol.URIFromSpanURI(span.URIFromPath(absDir)),
+		Recursive: false,
+	})
 	if err != nil {
 		return err
 	}
 	params := &protocol.ExecuteCommandParams{
-		Command:   source.CommandGenerate.ID(),
-		Arguments: jsonArgs,
+		Command:   cmd.Command,
+		Arguments: cmd.Arguments,
 	}
 	if _, err := e.ExecuteCommand(ctx, params); err != nil {
 		return fmt.Errorf("running generate: %v", err)

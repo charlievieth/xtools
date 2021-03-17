@@ -5,7 +5,8 @@
 Make sure `node` and `tsc` are installed and in your PATH. There are detailed instructions below.
 Get the typescript code for the jsonrpc protocol with
 
-`git clone git@github.com:microsoft vscode-languageserver-node.git`
+`git clone git@github.com:microsoft vscode-languageserver-node.git` or
+`git clone https://github.com/microsoft/vscode-languageserver-node.git`
 
 `util.ts`` expects it to be in your HOME directory
 
@@ -22,7 +23,7 @@ containing type definitions, and `tsserver.go`, `tsclient.go` containing API stu
 
 ## Notes
 
-1. `go.ts` and `requests.ts` use the Typescript compiler's API, which is [introduced](https://github.com/Microsoft/TypeScript/wiki/Architectural-Overview) in their wiki.
+1. `code.ts` and `util.ts` use the Typescript compiler's API, which is [introduced](https://github.com/Microsoft/TypeScript/wiki/Architectural-Overview) in their wiki.
 2. Because the Typescript and Go type systems are incompatible, `code.ts` and `util.ts` are filled with heuristics and special cases. Therefore they are tied to a specific commit of `vscode-languageserver-node`. The hash code of the commit is included in the header of
 the generated files and stored in the variable `gitHash` in `go.ts`. It is checked (see `git()` in `util.ts`) on every execution.
 3. Generating the `ts*.go` files is only semi-automated. Please file an issue if the released version is too far behind.

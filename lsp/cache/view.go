@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	exec "golang.org/x/sys/execabs"
 	"io"
 	"io/ioutil"
 	"os"
@@ -23,10 +22,12 @@ import (
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
+	exec "golang.org/x/sys/execabs"
 	"golang.org/x/tools/go/packages"
 	"github.com/charlievieth/xtools/event"
 	"github.com/charlievieth/xtools/gocommand"
 	"github.com/charlievieth/xtools/imports"
+	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/memoize"
 	"github.com/charlievieth/xtools/span"
@@ -59,6 +60,9 @@ type View struct {
 	folder span.URI
 
 	importsState *importsState
+
+	// moduleUpgrades tracks known upgrades for module paths.
+	moduleUpgrades map[string]string
 
 	// keep track of files by uri and by basename, a single file may be mapped
 	// to multiple uris, and the same basename may map to multiple files
@@ -232,6 +236,10 @@ func (v *View) Folder() span.URI {
 	return v.folder
 }
 
+func (v *View) TempWorkspace() span.URI {
+	return v.tempWorkspace
+}
+
 func (v *View) Options() *source.Options {
 	v.optionsMu.Lock()
 	defer v.optionsMu.Unlock()
@@ -380,24 +388,21 @@ func (v *View) knownFile(uri span.URI) bool {
 	return f != nil && err == nil
 }
 
-// getFile returns a file for the given URI. It will always succeed because it
-// adds the file to the managed set if needed.
-func (v *View) getFile(uri span.URI) (*fileBase, error) {
+// getFile returns a file for the given URI.
+func (v *View) getFile(uri span.URI) *fileBase {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	f, err := v.findFile(uri)
-	if err != nil {
-		return nil, err
-	} else if f != nil {
-		return f, nil
+	f, _ := v.findFile(uri)
+	if f != nil {
+		return f
 	}
 	f = &fileBase{
 		view:  v,
 		fname: uri.Filename(),
 	}
 	v.mapFile(uri, f)
-	return f, nil
+	return f
 }
 
 // findFile checks the cache for any file matching the given uri.
@@ -455,11 +460,6 @@ func (v *View) shutdown(ctx context.Context) {
 	go v.snapshot.generation.Destroy()
 	v.snapshotMu.Unlock()
 	v.importsState.destroy()
-	if v.tempWorkspace != "" {
-		if err := os.RemoveAll(v.tempWorkspace.Filename()); err != nil {
-			event.Error(ctx, "removing temp workspace", err)
-		}
-	}
 }
 
 func (v *View) Session() *Session {
@@ -536,49 +536,60 @@ func (s *snapshot) initialize(ctx context.Context, firstAttempt bool) {
 
 		// If we have multiple modules, we need to load them by paths.
 		var scopes []interface{}
-		var modErrors []*source.Error
+		var modDiagnostics []*source.Diagnostic
 		addError := func(uri span.URI, err error) {
-			modErrors = append(modErrors, &source.Error{
+			modDiagnostics = append(modDiagnostics, &source.Diagnostic{
 				URI:      uri,
-				Category: "compiler",
-				Kind:     source.ListError,
+				Severity: protocol.SeverityError,
+				Source:   source.ListError,
 				Message:  err.Error(),
 			})
 		}
-		for modURI := range s.workspace.getActiveModFiles() {
-			fh, err := s.GetFile(ctx, modURI)
-			if err != nil {
-				addError(modURI, err)
-				continue
+		if len(s.workspace.getActiveModFiles()) > 0 {
+			for modURI := range s.workspace.getActiveModFiles() {
+				fh, err := s.GetFile(ctx, modURI)
+				if err != nil {
+					addError(modURI, err)
+					continue
+				}
+				parsed, err := s.ParseMod(ctx, fh)
+				if err != nil {
+					addError(modURI, err)
+					continue
+				}
+				if parsed.File == nil || parsed.File.Module == nil {
+					addError(modURI, fmt.Errorf("no module path for %s", modURI))
+					continue
+				}
+				path := parsed.File.Module.Mod.Path
+				scopes = append(scopes, moduleLoadScope(path))
 			}
-			parsed, err := s.ParseMod(ctx, fh)
-			if err != nil {
-				addError(modURI, err)
-				continue
-			}
-			if parsed.File == nil || parsed.File.Module == nil {
-				addError(modURI, fmt.Errorf("no module path for %s", modURI))
-				continue
-			}
-			path := parsed.File.Module.Mod.Path
-			scopes = append(scopes, moduleLoadScope(path))
-		}
-		if len(scopes) == 0 {
+		} else {
 			scopes = append(scopes, viewLoadScope("LOAD_VIEW"))
 		}
-		err := s.load(ctx, firstAttempt, append(scopes, packagePath("builtin"))...)
+		var err error
+		if len(scopes) > 0 {
+			err = s.load(ctx, firstAttempt, append(scopes, packagePath("builtin"))...)
+		}
 		if ctx.Err() != nil {
 			return
 		}
 		if err != nil {
 			event.Error(ctx, "initial workspace load failed", err)
-			if modErrors != nil {
-				s.initializedErr = &source.CriticalError{
-					MainError: errors.Errorf("errors loading modules: %v: %w", err, modErrors),
-					ErrorList: modErrors,
-				}
-			} else {
-				s.initializedErr = err
+			extractedDiags, _ := s.extractGoCommandErrors(ctx, err.Error())
+			s.initializedErr = &source.CriticalError{
+				MainError: err,
+				DiagList:  append(modDiagnostics, extractedDiags...),
+			}
+		} else if len(modDiagnostics) == 1 {
+			s.initializedErr = &source.CriticalError{
+				MainError: fmt.Errorf(modDiagnostics[0].Message),
+				DiagList:  modDiagnostics,
+			}
+		} else if len(modDiagnostics) > 1 {
+			s.initializedErr = &source.CriticalError{
+				MainError: fmt.Errorf("error loading module names"),
+				DiagList:  modDiagnostics,
 			}
 		} else {
 			// Clear out the initialization error, in case it had been set
@@ -611,7 +622,9 @@ func (v *View) invalidateContent(ctx context.Context, changes map[span.URI]*file
 	v.snapshot, workspaceChanged = oldSnapshot.clone(ctx, v.baseCtx, changes, forceReloadMetadata)
 	if workspaceChanged && v.tempWorkspace != "" {
 		snap := v.snapshot
+		release := snap.generation.Acquire(ctx)
 		go func() {
+			defer release()
 			wsdir, err := snap.getWorkspaceDir(ctx)
 			if err != nil {
 				event.Error(ctx, "getting workspace dir", err)
@@ -861,6 +874,26 @@ func (s *Session) getGoEnv(ctx context.Context, folder string, goversion int, go
 
 func (v *View) IsGoPrivatePath(target string) bool {
 	return globsMatchPath(v.goprivate, target)
+}
+
+func (v *View) ModuleUpgrades() map[string]string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	upgrades := map[string]string{}
+	for mod, ver := range v.moduleUpgrades {
+		upgrades[mod] = ver
+	}
+	return upgrades
+}
+
+func (v *View) RegisterModuleUpgrades(upgrades map[string]string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	for mod, ver := range upgrades {
+		v.moduleUpgrades[mod] = ver
+	}
 }
 
 // Copied from

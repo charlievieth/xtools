@@ -95,6 +95,7 @@ type completionOptions struct {
 	fullDocumentation bool
 	placeholders      bool
 	literal           bool
+	snippets          bool
 	matcher           source.Matcher
 	budget            time.Duration
 }
@@ -519,6 +520,7 @@ func Completion(ctx context.Context, snapshot source.Snapshot, fh source.FileHan
 			placeholders:      opts.UsePlaceholders,
 			literal:           opts.LiteralCompletions && opts.InsertTextFormat == protocol.SnippetTextFormat,
 			budget:            opts.CompletionBudget,
+			snippets:          opts.InsertTextFormat == protocol.SnippetTextFormat,
 		},
 		// default to a matcher that always matches
 		matcher:        prefixMatcher(""),
@@ -1264,6 +1266,11 @@ func (c *completer) lexical(ctx context.Context) error {
 	var (
 		builtinIota = types.Universe.Lookup("iota")
 		builtinNil  = types.Universe.Lookup("nil")
+		// comparable is an interface that exists on the dev.typeparams Go branch.
+		// Filter it out from completion results to stabilize tests.
+		// TODO(rFindley) update (or remove) our handling for comparable once the
+		//                type parameter API has stabilized.
+		builtinComparable = types.Universe.Lookup("comparable")
 	)
 
 	// Track seen variables to avoid showing completions for shadowed variables.
@@ -1281,6 +1288,9 @@ func (c *completer) lexical(ctx context.Context) error {
 			declScope, obj := scope.LookupParent(name, c.pos)
 			if declScope != scope {
 				continue // Name was declared in some enclosing scope, or not at all.
+			}
+			if obj == builtinComparable {
+				continue
 			}
 
 			// If obj's type is invalid, find the AST node that defines the lexical block
@@ -1690,12 +1700,12 @@ func (c *completer) expectedCompositeLiteralType() types.Type {
 	switch t := clInfo.clType.(type) {
 	case *types.Slice:
 		if clInfo.inKey {
-			return types.Typ[types.Int]
+			return types.Typ[types.UntypedInt]
 		}
 		return t.Elem()
 	case *types.Array:
 		if clInfo.inKey {
-			return types.Typ[types.Int]
+			return types.Typ[types.UntypedInt]
 		}
 		return t.Elem()
 	case *types.Map:
@@ -2038,7 +2048,7 @@ Nodes:
 		case *ast.SliceExpr:
 			// Make sure position falls within the brackets (e.g. "foo[a:<>]").
 			if node.Lbrack < c.pos && c.pos <= node.Rbrack {
-				inf.objType = types.Typ[types.Int]
+				inf.objType = types.Typ[types.UntypedInt]
 			}
 			return inf
 		case *ast.IndexExpr:
@@ -2049,7 +2059,7 @@ Nodes:
 					case *types.Map:
 						inf.objType = t.Key()
 					case *types.Slice, *types.Array:
-						inf.objType = types.Typ[types.Int]
+						inf.objType = types.Typ[types.UntypedInt]
 					}
 				}
 			}
@@ -2444,6 +2454,11 @@ func (c *completer) matchingCandidate(cand *candidate) bool {
 		return false
 	}
 
+	// Bail out early if we are completing a field name in a composite literal.
+	if v, ok := cand.obj.(*types.Var); ok && v.IsField() && c.wantStructFieldCompletions() {
+		return true
+	}
+
 	if isTypeName(cand.obj) {
 		return c.matchingTypeName(cand)
 	} else if c.wantTypeName() {
@@ -2509,7 +2524,7 @@ func (ci *candidateInference) candTypeMatches(cand *candidate) bool {
 				continue
 			}
 
-			matches, untyped := ci.typeMatches(expType, candType)
+			matches := ci.typeMatches(expType, candType)
 			if !matches {
 				// If candType doesn't otherwise match, consider if we can
 				// convert candType directly to expType.
@@ -2531,7 +2546,7 @@ func (ci *candidateInference) candTypeMatches(cand *candidate) bool {
 			// Lower candidate score for untyped conversions. This avoids
 			// ranking untyped constants above candidates with an exact type
 			// match. Don't lower score of builtin constants, e.g. "true".
-			if untyped && !types.Identical(candType, expType) && cand.obj.Parent() != types.Universe {
+			if isUntyped(candType) && !types.Identical(candType, expType) && cand.obj.Parent() != types.Universe {
 				// Bigger penalty for deep completions into other packages to
 				// avoid random constants from other packages popping up all
 				// the time.
@@ -2598,21 +2613,34 @@ func considerTypeConversion(from, to types.Type, path []types.Object) bool {
 }
 
 // typeMatches reports whether an object of candType makes a good
-// completion candidate given the expected type expType. It also
-// returns a second bool which is true if both types are basic types
-// of the same kind, and at least one is untyped.
-func (ci *candidateInference) typeMatches(expType, candType types.Type) (bool, bool) {
+// completion candidate given the expected type expType.
+func (ci *candidateInference) typeMatches(expType, candType types.Type) bool {
 	// Handle untyped values specially since AssignableTo gives false negatives
 	// for them (see https://golang.org/issue/32146).
 	if candBasic, ok := candType.Underlying().(*types.Basic); ok {
-		if wantBasic, ok := expType.Underlying().(*types.Basic); ok {
-			// Make sure at least one of them is untyped.
-			if isUntyped(candType) || isUntyped(expType) {
-				// Check that their constant kind (bool|int|float|complex|string) matches.
+		if expBasic, ok := expType.Underlying().(*types.Basic); ok {
+			// Note that the candidate and/or the expected can be untyped.
+			// In "fo<> == 100" the expected type is untyped, and the
+			// candidate could also be an untyped constant.
+
+			// Sort by is_untyped and then by is_int to simplify below logic.
+			a, b := candBasic.Info(), expBasic.Info()
+			if a&types.IsUntyped == 0 || (b&types.IsInteger > 0 && b&types.IsUntyped > 0) {
+				a, b = b, a
+			}
+
+			// If at least one is untyped...
+			if a&types.IsUntyped > 0 {
+				switch {
+				// Untyped integers are compatible with floats.
+				case a&types.IsInteger > 0 && b&types.IsFloat > 0:
+					return true
+
+				// Check if their constant kind (bool|int|float|complex|string) matches.
 				// This doesn't take into account the constant value, so there will be some
 				// false positives due to integer sign and overflow.
-				if candBasic.Info()&types.IsConstType == wantBasic.Info()&types.IsConstType {
-					return true, true
+				case a&types.IsConstType == b&types.IsConstType:
+					return true
 				}
 			}
 		}
@@ -2620,7 +2648,7 @@ func (ci *candidateInference) typeMatches(expType, candType types.Type) (bool, b
 
 	// AssignableTo covers the case where the types are equal, but also handles
 	// cases like assigning a concrete type to an interface type.
-	return types.AssignableTo(candType, expType), false
+	return types.AssignableTo(candType, expType)
 }
 
 // kindMatches reports whether candType's kind matches our expected
@@ -2681,7 +2709,7 @@ func (ci *candidateInference) assigneesMatch(cand *candidate, sig *types.Signatu
 			continue
 		}
 
-		allMatch, _ = ci.typeMatches(assignee, sig.Results().At(i).Type())
+		allMatch = ci.typeMatches(assignee, sig.Results().At(i).Type())
 		if !allMatch {
 			break
 		}

@@ -8,8 +8,10 @@ package mod
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/charlievieth/xtools/event"
+	"github.com/charlievieth/xtools/lsp/command"
 	"github.com/charlievieth/xtools/lsp/debug/tag"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
@@ -26,22 +28,12 @@ func Diagnostics(ctx context.Context, snapshot source.Snapshot) (map[source.Vers
 			return nil, err
 		}
 		reports[fh.VersionedFileIdentity()] = []*source.Diagnostic{}
-		errors, err := ErrorsForMod(ctx, snapshot, fh)
+		diagnostics, err := DiagnosticsForMod(ctx, snapshot, fh)
 		if err != nil {
 			return nil, err
 		}
-		for _, e := range errors {
-			d := &source.Diagnostic{
-				Message: e.Message,
-				Range:   e.Range,
-				Source:  e.Category,
-			}
-			if e.Category == "syntax" || e.Kind == source.ListError {
-				d.Severity = protocol.SeverityError
-			} else {
-				d.Severity = protocol.SeverityWarning
-			}
-			fh, err := snapshot.GetVersionedFile(ctx, e.URI)
+		for _, d := range diagnostics {
+			fh, err := snapshot.GetVersionedFile(ctx, d.URI)
 			if err != nil {
 				return nil, err
 			}
@@ -51,7 +43,7 @@ func Diagnostics(ctx context.Context, snapshot source.Snapshot) (map[source.Vers
 	return reports, nil
 }
 
-func ErrorsForMod(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]*source.Error, error) {
+func DiagnosticsForMod(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]*source.Diagnostic, error) {
 	pm, err := snapshot.ParseMod(ctx, fh)
 	if err != nil {
 		if pm == nil || len(pm.ParseErrors) == 0 {
@@ -59,13 +51,66 @@ func ErrorsForMod(ctx context.Context, snapshot source.Snapshot, fh source.FileH
 		}
 		return pm.ParseErrors, nil
 	}
-	tidied, err := snapshot.ModTidy(ctx, pm)
 
-	if source.IsNonFatalGoModError(err) {
-		return nil, nil
+	var diagnostics []*source.Diagnostic
+
+	// Add upgrade quick fixes for individual modules if we know about them.
+	upgrades := snapshot.View().ModuleUpgrades()
+	for _, req := range pm.File.Require {
+		ver, ok := upgrades[req.Mod.Path]
+		if !ok || req.Mod.Version == ver {
+			continue
+		}
+		rng, err := lineToRange(pm.Mapper, fh.URI(), req.Syntax.Start, req.Syntax.End)
+		if err != nil {
+			return nil, err
+		}
+		// Upgrade to the exact version we offer the user, not the most recent.
+		title := fmt.Sprintf("Upgrade to %v", ver)
+		cmd, err := command.NewUpgradeDependencyCommand(title, command.DependencyArgs{
+			URI:        protocol.URIFromSpanURI(fh.URI()),
+			AddRequire: false,
+			GoCmdArgs:  []string{req.Mod.Path + "@" + ver},
+		})
+		if err != nil {
+			return nil, err
+		}
+		diagnostics = append(diagnostics, &source.Diagnostic{
+			URI:            fh.URI(),
+			Range:          rng,
+			Severity:       protocol.SeverityInformation,
+			Source:         source.UpgradeNotification,
+			Message:        fmt.Sprintf("%v can be upgraded", req.Mod.Path),
+			SuggestedFixes: []source.SuggestedFix{source.SuggestedFixFromCommand(cmd)},
+		})
 	}
-	if err != nil {
-		return nil, err
+
+	// Packages in the workspace can contribute diagnostics to go.mod files.
+	wspkgs, err := snapshot.WorkspacePackages(ctx)
+	if err != nil && !source.IsNonFatalGoModError(err) {
+		event.Error(ctx, "diagnosing go.mod", err)
 	}
-	return tidied.Errors, nil
+	if err == nil {
+		for _, pkg := range wspkgs {
+			pkgDiagnostics, err := snapshot.DiagnosePackage(ctx, pkg)
+			if err != nil {
+				return nil, err
+			}
+			diagnostics = append(diagnostics, pkgDiagnostics[fh.URI()]...)
+		}
+	}
+
+	tidied, err := snapshot.ModTidy(ctx, pm)
+	if err != nil && !source.IsNonFatalGoModError(err) {
+		event.Error(ctx, "diagnosing go.mod", err)
+	}
+	if err == nil {
+		for _, d := range tidied.Diagnostics {
+			if d.URI != fh.URI() {
+				continue
+			}
+			diagnostics = append(diagnostics, d)
+		}
+	}
+	return diagnostics, nil
 }

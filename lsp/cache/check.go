@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"go/ast"
+	"go/scanner"
 	"go/types"
 	"path"
 	"path/filepath"
@@ -17,11 +18,14 @@ import (
 	"sync"
 
 	"golang.org/x/mod/module"
+	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
 	"github.com/charlievieth/xtools/event"
 	"github.com/charlievieth/xtools/lsp/debug/tag"
+	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/memoize"
+	"github.com/charlievieth/xtools/packagesinternal"
 	"github.com/charlievieth/xtools/span"
 	"github.com/charlievieth/xtools/typesinternal"
 	errors "golang.org/x/xerrors"
@@ -266,11 +270,6 @@ func typeCheck(ctx context.Context, snapshot *snapshot, m *metadata, mode source
 	ctx, done := event.Start(ctx, "cache.importer.typeCheck", tag.Package.Of(string(m.id)))
 	defer done()
 
-	var rawErrors []error
-	for _, err := range m.errors {
-		rawErrors = append(rawErrors, err)
-	}
-
 	fset := snapshot.view.session.cache.fset
 	pkg := &pkg{
 		m:               m,
@@ -302,12 +301,12 @@ func typeCheck(ctx context.Context, snapshot *snapshot, m *metadata, mode source
 	}
 	var (
 		files        = make([]*ast.File, len(m.compiledGoFiles))
-		parseErrors  = make([]error, len(m.compiledGoFiles))
+		parseErrors  = make([]scanner.ErrorList, len(m.compiledGoFiles))
 		actualErrors = make([]error, len(m.compiledGoFiles))
 		wg           sync.WaitGroup
 
 		mu             sync.Mutex
-		skipTypeErrors bool
+		haveFixedFiles bool
 	)
 	for i, cgf := range m.compiledGoFiles {
 		wg.Add(1)
@@ -327,8 +326,10 @@ func typeCheck(ctx context.Context, snapshot *snapshot, m *metadata, mode source
 			pkg.compiledGoFiles[i] = pgf
 			files[i], parseErrors[i], actualErrors[i] = pgf.File, pgf.ParseErr, err
 
+			// If we have fixed parse errors in any of the files, we should hide type
+			// errors, as they may be completely nonsensical.
 			mu.Lock()
-			skipTypeErrors = skipTypeErrors || fixed
+			haveFixedFiles = haveFixedFiles || fixed
 			mu.Unlock()
 		}(i, cgf)
 	}
@@ -352,13 +353,16 @@ func typeCheck(ctx context.Context, snapshot *snapshot, m *metadata, mode source
 		}
 	}
 
+	var i int
 	for _, e := range parseErrors {
 		if e != nil {
-			rawErrors = append(rawErrors, e)
+			parseErrors[i] = e
+			i++
 		}
 	}
+	parseErrors = parseErrors[:i]
 
-	var i int
+	i = 0
 	for _, f := range files {
 		if f != nil {
 			files[i] = f
@@ -374,32 +378,28 @@ func typeCheck(ctx context.Context, snapshot *snapshot, m *metadata, mode source
 		// race to Unsafe.completed.
 		return pkg, nil
 	} else if len(files) == 0 { // not the unsafe package, no parsed files
-		// Try to attach errors messages to the file as much as possible.
+		// Try to attach error messages to the file as much as possible.
 		var found bool
-		for _, e := range rawErrors {
-			srcErr, err := sourceError(ctx, snapshot, pkg, e)
+		for _, e := range m.errors {
+			srcDiags, err := goPackagesErrorDiagnostics(ctx, snapshot, pkg, e)
 			if err != nil {
 				continue
 			}
 			found = true
-			pkg.errors = append(pkg.errors, srcErr)
+			pkg.diagnostics = append(pkg.diagnostics, srcDiags...)
 		}
 		if found {
 			return pkg, nil
 		}
-		return nil, errors.Errorf("no parsed files for package %s, expected: %v, list errors: %v", pkg.m.pkgPath, pkg.compiledGoFiles, rawErrors)
+		return nil, errors.Errorf("no parsed files for package %s, expected: %v, errors: %v", pkg.m.pkgPath, pkg.compiledGoFiles, m.errors)
 	} else {
 		pkg.types = types.NewPackage(string(m.pkgPath), string(m.name))
 	}
 
+	var typeErrors []types.Error
 	cfg := &types.Config{
 		Error: func(e error) {
-			// If we have fixed parse errors in any of the files,
-			// we should hide type errors, as they may be completely nonsensical.
-			if skipTypeErrors {
-				return
-			}
-			rawErrors = append(rawErrors, e)
+			typeErrors = append(typeErrors, e.(types.Error))
 		},
 		Importer: importerFunc(func(pkgPath string) (*types.Package, error) {
 			// If the context was cancelled, we should abort.
@@ -436,22 +436,207 @@ func typeCheck(ctx context.Context, snapshot *snapshot, m *metadata, mode source
 	}
 
 	// We don't care about a package's errors unless we have parsed it in full.
-	if mode == source.ParseFull {
-		expandErrors(rawErrors)
-		for _, e := range rawErrors {
-			srcErr, err := sourceError(ctx, snapshot, pkg, e)
+	if mode != source.ParseFull {
+		return pkg, nil
+	}
+
+	if len(m.errors) != 0 {
+		pkg.hasListOrParseErrors = true
+		for _, e := range m.errors {
+			diags, err := goPackagesErrorDiagnostics(ctx, snapshot, pkg, e)
 			if err != nil {
-				event.Error(ctx, "unable to compute error positions", err, tag.Package.Of(pkg.ID()))
+				event.Error(ctx, "unable to compute positions for list errors", err, tag.Package.Of(pkg.ID()))
 				continue
 			}
-			pkg.errors = append(pkg.errors, srcErr)
-			if err, ok := e.(extendedError); ok {
-				pkg.typeErrors = append(pkg.typeErrors, err.primary)
+			pkg.diagnostics = append(pkg.diagnostics, diags...)
+		}
+	}
+
+	// Our heuristic for whether to show type checking errors is:
+	//  + If any file was 'fixed', don't show type checking errors as we
+	//    can't guarantee that they reference accurate locations in the source.
+	//  + If there is a parse error _in the current file_, suppress type
+	//    errors in that file.
+	//  + Otherwise, show type errors even in the presence of parse errors in
+	//    other package files. go/types attempts to suppress follow-on errors
+	//    due to bad syntax, so on balance type checking errors still provide
+	//    a decent signal/noise ratio as long as the file in question parses.
+
+	// Track URIs with parse errors so that we can suppress type errors for these
+	// files.
+	unparseable := map[span.URI]bool{}
+	if len(parseErrors) != 0 {
+		pkg.hasListOrParseErrors = true
+		for _, e := range parseErrors {
+			diags, err := parseErrorDiagnostics(ctx, snapshot, pkg, e)
+			if err != nil {
+				event.Error(ctx, "unable to compute positions for parse errors", err, tag.Package.Of(pkg.ID()))
+				continue
+			}
+			for _, diag := range diags {
+				unparseable[diag.URI] = true
+				pkg.diagnostics = append(pkg.diagnostics, diag)
 			}
 		}
 	}
 
+	if haveFixedFiles {
+		return pkg, nil
+	}
+
+	for _, e := range expandErrors(typeErrors, snapshot.View().Options().RelatedInformationSupported) {
+		pkg.hasTypeErrors = true
+		diags, err := typeErrorDiagnostics(ctx, snapshot, pkg, e)
+		if err != nil {
+			event.Error(ctx, "unable to compute positions for type errors", err, tag.Package.Of(pkg.ID()))
+			continue
+		}
+		pkg.typeErrors = append(pkg.typeErrors, e.primary)
+		for _, diag := range diags {
+			// If the file didn't parse cleanly, it is highly likely that type
+			// checking errors will be confusing or redundant. But otherwise, type
+			// checking usually provides a good enough signal to include.
+			if !unparseable[diag.URI] {
+				pkg.diagnostics = append(pkg.diagnostics, diag)
+			}
+		}
+	}
+
+	depsErrors, err := snapshot.depsErrors(ctx, pkg)
+	if err != nil {
+		return nil, err
+	}
+	pkg.diagnostics = append(pkg.diagnostics, depsErrors...)
+
 	return pkg, nil
+}
+
+func (s *snapshot) depsErrors(ctx context.Context, pkg *pkg) ([]*source.Diagnostic, error) {
+	// Select packages that can't be found, and were imported in non-workspace packages.
+	// Workspace packages already show their own errors.
+	var relevantErrors []*packagesinternal.PackageError
+	for _, depsError := range pkg.m.depsErrors {
+		// Up to Go 1.15, the missing package was included in the stack, which
+		// was presumably a bug. We want the next one up.
+		directImporterIdx := len(depsError.ImportStack) - 1
+		if s.view.goversion < 15 {
+			directImporterIdx = len(depsError.ImportStack) - 2
+		}
+		if directImporterIdx < 0 {
+			continue
+		}
+
+		directImporter := depsError.ImportStack[directImporterIdx]
+		if _, ok := s.isWorkspacePackage(packageID(directImporter)); ok {
+			continue
+		}
+		relevantErrors = append(relevantErrors, depsError)
+	}
+
+	// Don't build the import index for nothing.
+	if len(relevantErrors) == 0 {
+		return nil, nil
+	}
+
+	// Build an index of all imports in the package.
+	type fileImport struct {
+		cgf *source.ParsedGoFile
+		imp *ast.ImportSpec
+	}
+	allImports := map[string][]fileImport{}
+	for _, cgf := range pkg.compiledGoFiles {
+		for _, group := range astutil.Imports(s.FileSet(), cgf.File) {
+			for _, imp := range group {
+				if imp.Path == nil {
+					continue
+				}
+				path := strings.Trim(imp.Path.Value, `"`)
+				allImports[path] = append(allImports[path], fileImport{cgf, imp})
+			}
+		}
+	}
+
+	// Apply a diagnostic to any import involved in the error, stopping once
+	// we reach the workspace.
+	var errors []*source.Diagnostic
+	for _, depErr := range relevantErrors {
+		for i := len(depErr.ImportStack) - 1; i >= 0; i-- {
+			item := depErr.ImportStack[i]
+			if _, ok := s.isWorkspacePackage(packageID(item)); ok {
+				break
+			}
+
+			for _, imp := range allImports[item] {
+				rng, err := source.NewMappedRange(s.FileSet(), imp.cgf.Mapper, imp.imp.Pos(), imp.imp.End()).Range()
+				if err != nil {
+					return nil, err
+				}
+				fixes, err := goGetQuickFixes(s, imp.cgf.URI, item)
+				if err != nil {
+					return nil, err
+				}
+				errors = append(errors, &source.Diagnostic{
+					URI:            imp.cgf.URI,
+					Range:          rng,
+					Severity:       protocol.SeverityError,
+					Source:         source.TypeError,
+					Message:        fmt.Sprintf("error while importing %v: %v", item, depErr.Err),
+					SuggestedFixes: fixes,
+				})
+			}
+		}
+	}
+
+	if len(pkg.compiledGoFiles) == 0 {
+		return errors, nil
+	}
+	mod := s.GoModForFile(pkg.compiledGoFiles[0].URI)
+	if mod == "" {
+		return errors, nil
+	}
+	fh, err := s.GetFile(ctx, mod)
+	if err != nil {
+		return nil, err
+	}
+	pm, err := s.ParseMod(ctx, fh)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add a diagnostic to the module that contained the lowest-level import of
+	// the missing package.
+	for _, depErr := range relevantErrors {
+		for i := len(depErr.ImportStack) - 1; i >= 0; i-- {
+			item := depErr.ImportStack[i]
+			m := s.getMetadata(packageID(item))
+			if m == nil || m.module == nil {
+				continue
+			}
+			modVer := module.Version{Path: m.module.Path, Version: m.module.Version}
+			reference := findModuleReference(pm.File, modVer)
+			if reference == nil {
+				continue
+			}
+			rng, err := rangeFromPositions(pm.Mapper, reference.Start, reference.End)
+			if err != nil {
+				return nil, err
+			}
+			fixes, err := goGetQuickFixes(s, pm.URI, item)
+			if err != nil {
+				return nil, err
+			}
+			errors = append(errors, &source.Diagnostic{
+				URI:            pm.URI,
+				Range:          rng,
+				Severity:       protocol.SeverityError,
+				Source:         source.TypeError,
+				Message:        fmt.Sprintf("error while importing %v: %v", item, depErr.Err),
+				SuggestedFixes: fixes,
+			})
+			break
+		}
+	}
+	return errors, nil
 }
 
 // missingPkgError returns an error message for a missing package that varies
@@ -488,30 +673,55 @@ func (e extendedError) Error() string {
 // there is a multiply-defined function, the secondary error points back to the
 // definition first noticed.
 //
-// This code associates the secondary error with its primary error, which can
+// This function associates the secondary error with its primary error, which can
 // then be used as RelatedInformation when the error becomes a diagnostic.
-func expandErrors(errs []error) []error {
+//
+// If supportsRelatedInformation is false, the secondary is instead embedded as
+// additional context in the primary error.
+func expandErrors(errs []types.Error, supportsRelatedInformation bool) []extendedError {
+	var result []extendedError
 	for i := 0; i < len(errs); {
-		e, ok := errs[i].(types.Error)
-		if !ok {
-			i++
-			continue
+		original := extendedError{
+			primary: errs[i],
 		}
-		enew := extendedError{
-			primary: e,
-		}
-		j := i + 1
-		for ; j < len(errs); j++ {
-			spl, ok := errs[j].(types.Error)
-			if !ok || len(spl.Msg) == 0 || spl.Msg[0] != '\t' {
+		for i++; i < len(errs); i++ {
+			spl := errs[i]
+			if len(spl.Msg) == 0 || spl.Msg[0] != '\t' {
 				break
 			}
-			enew.secondaries = append(enew.secondaries, spl)
+			spl.Msg = spl.Msg[1:]
+			original.secondaries = append(original.secondaries, spl)
 		}
-		errs[i] = enew
-		i = j
+
+		// Clone the error to all its related locations -- VS Code, at least,
+		// doesn't do it for us.
+		result = append(result, original)
+		for i, mainSecondary := range original.secondaries {
+			// Create the new primary error, with a tweaked message, in the
+			// secondary's location. We need to start from the secondary to
+			// capture its unexported location fields.
+			relocatedSecondary := mainSecondary
+			if supportsRelatedInformation {
+				relocatedSecondary.Msg = fmt.Sprintf("%v (see details)", original.primary.Msg)
+			} else {
+				relocatedSecondary.Msg = fmt.Sprintf("%v (this error: %v)", original.primary.Msg, mainSecondary.Msg)
+			}
+			relocatedSecondary.Soft = original.primary.Soft
+
+			// Copy over the secondary errors, noting the location of the
+			// current error we're cloning.
+			clonedError := extendedError{primary: relocatedSecondary, secondaries: []types.Error{original.primary}}
+			for j, secondary := range original.secondaries {
+				if i == j {
+					secondary.Msg += " (this error)"
+				}
+				clonedError.secondaries = append(clonedError.secondaries, secondary)
+			}
+			result = append(result, clonedError)
+		}
+
 	}
-	return errs
+	return result
 }
 
 // resolveImportPath resolves an import path in pkg to a package from deps.

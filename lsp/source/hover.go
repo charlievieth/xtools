@@ -9,10 +9,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/doc"
 	"go/format"
 	"go/types"
 	"strings"
+	"time"
 
 	"github.com/charlievieth/xtools/event"
 	"github.com/charlievieth/xtools/lsp/protocol"
@@ -187,6 +189,10 @@ func HoverIdentifier(ctx context.Context, i *IdentifierInfo) (*HoverInformation,
 			}
 		}
 	}
+	if obj.Pkg() == nil {
+		event.Log(ctx, fmt.Sprintf("nil package for %s", obj))
+		return h, nil
+	}
 	h.importPath = obj.Pkg().Path()
 	h.LinkPath = h.importPath
 	if mod, version, ok := moduleAtVersion(h.LinkPath, i); ok {
@@ -228,6 +234,18 @@ func objectString(obj types.Object, qf types.Qualifier) string {
 	switch obj := obj.(type) {
 	case *types.Const:
 		str = fmt.Sprintf("%s = %s", str, obj.Val())
+
+		// Try to add a formatted duration as an inline comment
+		typ, ok := obj.Type().(*types.Named)
+		if !ok {
+			break
+		}
+		pkg := typ.Obj().Pkg()
+		if pkg.Path() == "time" && typ.Obj().Name() == "Duration" {
+			if d, ok := constant.Int64Val(obj.Val()); ok {
+				str += " // " + time.Duration(d).String()
+			}
+		}
 	}
 	return str
 }

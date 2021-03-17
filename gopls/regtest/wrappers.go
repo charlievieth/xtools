@@ -5,13 +5,14 @@
 package regtest
 
 import (
+	"encoding/json"
 	"io"
 	"path"
 	"testing"
 
+	"github.com/charlievieth/xtools/lsp/command"
 	"github.com/charlievieth/xtools/lsp/fake"
 	"github.com/charlievieth/xtools/lsp/protocol"
-	"github.com/charlievieth/xtools/lsp/source"
 	errors "golang.org/x/xerrors"
 )
 
@@ -200,6 +201,16 @@ func (e *Env) ApplyQuickFixes(path string, diagnostics []protocol.Diagnostic) {
 	}
 }
 
+// GetQuickFixes returns the available quick fix code actions.
+func (e *Env) GetQuickFixes(path string, diagnostics []protocol.Diagnostic) []protocol.CodeAction {
+	e.T.Helper()
+	actions, err := e.Editor.GetQuickFixes(e.Ctx, path, nil, diagnostics)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	return actions
+}
+
 // Hover in the editor, calling t.Fatal on any error.
 func (e *Env) Hover(name string, pos fake.Pos) (*protocol.MarkupContent, fake.Pos) {
 	e.T.Helper()
@@ -265,6 +276,8 @@ func (e *Env) RunGoCommandInDir(dir, verb string, args ...string) {
 	}
 }
 
+// DumpGoSum prints the correct go.sum contents for dir in txtar format,
+// for use in creating regtests.
 func (e *Env) DumpGoSum(dir string) {
 	e.T.Helper()
 
@@ -299,7 +312,8 @@ func (e *Env) CodeLens(path string) []protocol.CodeLens {
 
 // ExecuteCodeLensCommand executes the command for the code lens matching the
 // given command name.
-func (e *Env) ExecuteCodeLensCommand(path string, cmd *source.Command) {
+func (e *Env) ExecuteCodeLensCommand(path string, cmd command.Command) {
+	e.T.Helper()
 	lenses := e.CodeLens(path)
 	var lens protocol.CodeLens
 	var found bool
@@ -312,10 +326,32 @@ func (e *Env) ExecuteCodeLensCommand(path string, cmd *source.Command) {
 	if !found {
 		e.T.Fatalf("found no command with the ID %s", cmd.ID())
 	}
-	if _, err := e.Editor.ExecuteCommand(e.Ctx, &protocol.ExecuteCommandParams{
+	e.ExecuteCommand(&protocol.ExecuteCommandParams{
 		Command:   lens.Command.Command,
 		Arguments: lens.Command.Arguments,
-	}); err != nil {
+	}, nil)
+}
+
+func (e *Env) ExecuteCommand(params *protocol.ExecuteCommandParams, result interface{}) {
+	e.T.Helper()
+	response, err := e.Editor.ExecuteCommand(e.Ctx, params)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	if result == nil {
+		return
+	}
+	// Hack: The result of an executeCommand request will be unmarshaled into
+	// maps. Re-marshal and unmarshal into the type we expect.
+	//
+	// This could be improved by generating a jsonrpc2 command client from the
+	// command.Interface, but that should only be done if we're consolidating
+	// this part of the tsprotocol generation.
+	data, err := json.Marshal(response)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	if err := json.Unmarshal(data, result); err != nil {
 		e.T.Fatal(err)
 	}
 }

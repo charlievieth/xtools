@@ -7,18 +7,18 @@ package lsp
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 
-	"golang.org/x/tools/go/analysis"
 	"github.com/charlievieth/xtools/event"
 	"github.com/charlievieth/xtools/imports"
+	"github.com/charlievieth/xtools/lsp/command"
 	"github.com/charlievieth/xtools/lsp/debug/tag"
 	"github.com/charlievieth/xtools/lsp/mod"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/span"
+	errors "golang.org/x/xerrors"
 )
 
 func (s *Server) codeAction(ctx context.Context, params *protocol.CodeActionParams) ([]protocol.CodeAction, error) {
@@ -62,14 +62,18 @@ func (s *Server) codeAction(ctx context.Context, params *protocol.CodeActionPara
 	switch fh.Kind() {
 	case source.Mod:
 		if diagnostics := params.Context.Diagnostics; len(diagnostics) > 0 {
-			modQuickFixes, err := moduleQuickFixes(ctx, snapshot, fh, diagnostics)
+			diags, err := mod.DiagnosticsForMod(ctx, snapshot, fh)
 			if source.IsNonFatalGoModError(err) {
 				return nil, nil
 			}
 			if err != nil {
 				return nil, err
 			}
-			codeActions = append(codeActions, modQuickFixes...)
+			quickFixes, err := codeActionsMatchingDiagnostics(ctx, snapshot, diagnostics, diags)
+			if err != nil {
+				return nil, err
+			}
+			codeActions = append(codeActions, quickFixes...)
 		}
 	case source.Go:
 		// Don't suggest fixes for generated files, since they are generally
@@ -105,15 +109,6 @@ func (s *Server) codeAction(ctx context.Context, params *protocol.CodeActionPara
 				}
 			}
 
-			// Fix unresolved imports with "go get". This is separate from the
-			// goimports fixes because goimports will not remove an import
-			// that appears to be used, even if currently unresolved.
-			actions, err := goGetFixes(ctx, snapshot, fh.URI(), diagnostics)
-			if err != nil {
-				return nil, err
-			}
-			codeActions = append(codeActions, actions...)
-
 			// Send all of the import edits as one code action if the file is
 			// being organized.
 			if wanted[protocol.SourceOrganizeImports] && len(importEdits) > 0 {
@@ -133,45 +128,68 @@ func (s *Server) codeAction(ctx context.Context, params *protocol.CodeActionPara
 		if err != nil {
 			return nil, err
 		}
-		if (wanted[protocol.QuickFix] || wanted[protocol.SourceFixAll]) && len(diagnostics) > 0 {
-			analysisQuickFixes, highConfidenceEdits, err := analysisFixes(ctx, snapshot, pkg, diagnostics)
-			if err != nil {
-				return nil, err
-			}
-			if wanted[protocol.QuickFix] {
-				// Add the quick fixes reported by go/analysis.
-				codeActions = append(codeActions, analysisQuickFixes...)
 
-				// If there are any diagnostics relating to the go.mod file,
-				// add their corresponding quick fixes.
-				modQuickFixes, err := moduleQuickFixes(ctx, snapshot, fh, diagnostics)
-				if source.IsNonFatalGoModError(err) {
-					// Not a fatal error.
-					event.Error(ctx, "module suggested fixes failed", err, tag.Directory.Of(snapshot.View().Folder()))
-				}
-				codeActions = append(codeActions, modQuickFixes...)
-			}
-			if wanted[protocol.SourceFixAll] && len(highConfidenceEdits) > 0 {
-				codeActions = append(codeActions, protocol.CodeAction{
-					Title: "Simplifications",
-					Kind:  protocol.SourceFixAll,
-					Edit: protocol.WorkspaceEdit{
-						DocumentChanges: highConfidenceEdits,
-					},
-				})
-			}
+		pkgDiagnostics, err := snapshot.DiagnosePackage(ctx, pkg)
+		if err != nil {
+			return nil, err
 		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		analysisDiags, err := source.Analyze(ctx, snapshot, pkg, true)
+		if err != nil {
+			return nil, err
 		}
-		// Add any suggestions that do not necessarily fix any diagnostics.
-		if wanted[protocol.RefactorRewrite] {
-			fixes, err := convenienceFixes(ctx, snapshot, pkg, uri, params.Range)
+		fileDiags := append(pkgDiagnostics[uri], analysisDiags[uri]...)
+		modURI := snapshot.GoModForFile(fh.URI())
+		if modURI != "" {
+			modFH, err := snapshot.GetVersionedFile(ctx, modURI)
 			if err != nil {
 				return nil, err
 			}
-			codeActions = append(codeActions, fixes...)
+			modDiags, err := mod.DiagnosticsForMod(ctx, snapshot, modFH)
+			if err != nil && !source.IsNonFatalGoModError(err) {
+				// Not a fatal error.
+				event.Error(ctx, "module suggested fixes failed", err, tag.Directory.Of(snapshot.View().Folder()))
+			}
+			fileDiags = append(fileDiags, modDiags...)
 		}
+
+		// Split diagnostics into fixes, which must match incoming diagnostics,
+		// and non-fixes, which must match the requested range. Build actions
+		// for all of them.
+		var fixDiags, nonFixDiags []*source.Diagnostic
+		for _, d := range fileDiags {
+			if len(d.SuggestedFixes) == 0 {
+				continue
+			}
+			kind := protocol.QuickFix
+			if d.Analyzer != nil && d.Analyzer.ActionKind != "" {
+				kind = d.Analyzer.ActionKind
+			}
+			if kind == protocol.QuickFix || kind == protocol.SourceFixAll {
+				fixDiags = append(fixDiags, d)
+			} else {
+				nonFixDiags = append(nonFixDiags, d)
+			}
+		}
+
+		fixActions, err := codeActionsMatchingDiagnostics(ctx, snapshot, diagnostics, fixDiags)
+		if err != nil {
+			return nil, err
+		}
+		codeActions = append(codeActions, fixActions...)
+
+		for _, nonfix := range nonFixDiags {
+			// For now, only show diagnostics for matching lines. Maybe we should
+			// alter this behavior in the future, depending on the user experience.
+			if !protocol.Intersect(nonfix.Range, params.Range) {
+				continue
+			}
+			actions, err := codeActionsForDiagnostic(ctx, snapshot, nonfix, nil)
+			if err != nil {
+				return nil, err
+			}
+			codeActions = append(codeActions, actions...)
+		}
+
 		if wanted[protocol.RefactorExtract] {
 			fixes, err := extractionFixes(ctx, snapshot, pkg, uri, params.Range)
 			if err != nil {
@@ -192,7 +210,14 @@ func (s *Server) codeAction(ctx context.Context, params *protocol.CodeActionPara
 		// Unsupported file kind for a code action.
 		return nil, nil
 	}
-	return codeActions, nil
+
+	var filtered []protocol.CodeAction
+	for _, action := range codeActions {
+		if wanted[action.Kind] {
+			filtered = append(filtered, action)
+		}
+	}
+	return filtered, nil
 }
 
 func (s *Server) getSupportedCodeActions() []protocol.CodeActionKind {
@@ -253,211 +278,6 @@ func importDiagnostics(fix *imports.ImportFix, diagnostics []protocol.Diagnostic
 	return results
 }
 
-func analysisFixes(ctx context.Context, snapshot source.Snapshot, pkg source.Package, diagnostics []protocol.Diagnostic) ([]protocol.CodeAction, []protocol.TextDocumentEdit, error) {
-	if len(diagnostics) == 0 {
-		return nil, nil, nil
-	}
-	var (
-		codeActions       []protocol.CodeAction
-		sourceFixAllEdits []protocol.TextDocumentEdit
-	)
-	for _, diag := range diagnostics {
-		srcErr, analyzer, ok := findSourceError(ctx, snapshot, pkg.ID(), diag)
-		if !ok {
-			continue
-		}
-		// If the suggested fix for the diagnostic is expected to be separate,
-		// see if there are any supported commands available.
-		if analyzer.Command != nil {
-			action, err := diagnosticToCommandCodeAction(ctx, snapshot, srcErr, &diag, protocol.QuickFix)
-			if err != nil {
-				return nil, nil, err
-			}
-			codeActions = append(codeActions, *action)
-			continue
-		}
-		for _, fix := range srcErr.SuggestedFixes {
-			action := protocol.CodeAction{
-				Title:       fix.Title,
-				Kind:        protocol.QuickFix,
-				Diagnostics: []protocol.Diagnostic{diag},
-				Edit:        protocol.WorkspaceEdit{},
-			}
-			for uri, edits := range fix.Edits {
-				fh, err := snapshot.GetVersionedFile(ctx, uri)
-				if err != nil {
-					return nil, nil, err
-				}
-				docChanges := documentChanges(fh, edits)
-				if analyzer.HighConfidence {
-					sourceFixAllEdits = append(sourceFixAllEdits, docChanges...)
-				}
-				action.Edit.DocumentChanges = append(action.Edit.DocumentChanges, docChanges...)
-			}
-			codeActions = append(codeActions, action)
-		}
-	}
-	return codeActions, sourceFixAllEdits, nil
-}
-
-func findSourceError(ctx context.Context, snapshot source.Snapshot, pkgID string, diag protocol.Diagnostic) (*source.Error, source.Analyzer, bool) {
-	analyzer := diagnosticToAnalyzer(snapshot, diag.Source, diag.Message)
-	if analyzer == nil {
-		return nil, source.Analyzer{}, false
-	}
-	analysisErrors, err := snapshot.Analyze(ctx, pkgID, analyzer.Analyzer)
-	if err != nil {
-		return nil, source.Analyzer{}, false
-	}
-	for _, err := range analysisErrors {
-		if err.Message != diag.Message {
-			continue
-		}
-		if protocol.CompareRange(err.Range, diag.Range) != 0 {
-			continue
-		}
-		if err.Category != analyzer.Analyzer.Name {
-			continue
-		}
-		// The error matches.
-		return err, *analyzer, true
-	}
-	return nil, source.Analyzer{}, false
-}
-
-// diagnosticToAnalyzer return the analyzer associated with a given diagnostic.
-// It assumes that the diagnostic's source will be the name of the analyzer.
-// If this changes, this approach will need to be reworked.
-func diagnosticToAnalyzer(snapshot source.Snapshot, src, msg string) (analyzer *source.Analyzer) {
-	// Make sure that the analyzer we found is enabled.
-	defer func() {
-		if analyzer != nil && !analyzer.IsEnabled(snapshot.View()) {
-			analyzer = nil
-		}
-	}()
-	if a, ok := snapshot.View().Options().DefaultAnalyzers[src]; ok {
-		return &a
-	}
-	if a, ok := snapshot.View().Options().StaticcheckAnalyzers[src]; ok {
-		return &a
-	}
-	if a, ok := snapshot.View().Options().ConvenienceAnalyzers[src]; ok {
-		return &a
-	}
-	// Hack: We publish diagnostics with the source "compiler" for type errors,
-	// but these analyzers have different names. Try both possibilities.
-	if a, ok := snapshot.View().Options().TypeErrorAnalyzers[src]; ok {
-		return &a
-	}
-	if src != "compiler" {
-		return nil
-	}
-	for _, a := range snapshot.View().Options().TypeErrorAnalyzers {
-		if a.FixesError(msg) {
-			return &a
-		}
-	}
-	return nil
-}
-
-var importErrorRe = regexp.MustCompile(`could not import ([^\s]+)`)
-
-func goGetFixes(ctx context.Context, snapshot source.Snapshot, uri span.URI, diagnostics []protocol.Diagnostic) ([]protocol.CodeAction, error) {
-	if snapshot.GoModForFile(uri) == "" {
-		// Go get only supports module mode for now.
-		return nil, nil
-	}
-
-	var actions []protocol.CodeAction
-	for _, diag := range diagnostics {
-		matches := importErrorRe.FindStringSubmatch(diag.Message)
-		if len(matches) == 0 {
-			return nil, nil
-		}
-		args, err := source.MarshalArgs(uri, matches[1])
-		if err != nil {
-			return nil, err
-		}
-		actions = append(actions, protocol.CodeAction{
-			Title:       fmt.Sprintf("go get package %v", matches[1]),
-			Diagnostics: []protocol.Diagnostic{diag},
-			Kind:        protocol.QuickFix,
-			Command: &protocol.Command{
-				Title:     source.CommandGoGetPackage.Title,
-				Command:   source.CommandGoGetPackage.ID(),
-				Arguments: args,
-			},
-		})
-	}
-	return actions, nil
-}
-
-func convenienceFixes(ctx context.Context, snapshot source.Snapshot, pkg source.Package, uri span.URI, rng protocol.Range) ([]protocol.CodeAction, error) {
-	var analyzers []*analysis.Analyzer
-	for _, a := range snapshot.View().Options().ConvenienceAnalyzers {
-		if !a.IsEnabled(snapshot.View()) {
-			continue
-		}
-		if a.Command == nil {
-			event.Error(ctx, "convenienceFixes", fmt.Errorf("no suggested fixes for convenience analyzer %s", a.Analyzer.Name))
-			continue
-		}
-		analyzers = append(analyzers, a.Analyzer)
-	}
-	diagnostics, err := snapshot.Analyze(ctx, pkg.ID(), analyzers...)
-	if err != nil {
-		return nil, err
-	}
-	var codeActions []protocol.CodeAction
-	for _, d := range diagnostics {
-		// For now, only show diagnostics for matching lines. Maybe we should
-		// alter this behavior in the future, depending on the user experience.
-		if d.URI != uri {
-			continue
-		}
-
-		if !protocol.Intersect(d.Range, rng) {
-			continue
-		}
-		action, err := diagnosticToCommandCodeAction(ctx, snapshot, d, nil, protocol.RefactorRewrite)
-		if err != nil {
-			return nil, err
-		}
-		codeActions = append(codeActions, *action)
-	}
-	return codeActions, nil
-}
-
-func diagnosticToCommandCodeAction(ctx context.Context, snapshot source.Snapshot, e *source.Error, d *protocol.Diagnostic, kind protocol.CodeActionKind) (*protocol.CodeAction, error) {
-	// The fix depends on the category of the analyzer. The diagnostic may be
-	// nil, so use the error's category.
-	analyzer := diagnosticToAnalyzer(snapshot, e.Category, e.Message)
-	if analyzer == nil {
-		return nil, fmt.Errorf("no convenience analyzer for category %s", e.Category)
-	}
-	if analyzer.Command == nil {
-		return nil, fmt.Errorf("no command for convenience analyzer %s", analyzer.Analyzer.Name)
-	}
-	jsonArgs, err := source.MarshalArgs(e.URI, e.Range)
-	if err != nil {
-		return nil, err
-	}
-	var diagnostics []protocol.Diagnostic
-	if d != nil {
-		diagnostics = append(diagnostics, *d)
-	}
-	return &protocol.CodeAction{
-		Title:       e.Message,
-		Kind:        kind,
-		Diagnostics: diagnostics,
-		Command: &protocol.Command{
-			Command:   analyzer.Command.ID(),
-			Title:     e.Message,
-			Arguments: jsonArgs,
-		},
-	}, nil
-}
-
 func extractionFixes(ctx context.Context, snapshot source.Snapshot, pkg source.Package, uri span.URI, rng protocol.Range) ([]protocol.CodeAction, error) {
 	if rng.Start == rng.End {
 		return nil, nil
@@ -466,25 +286,44 @@ func extractionFixes(ctx context.Context, snapshot source.Snapshot, pkg source.P
 	if err != nil {
 		return nil, err
 	}
-	jsonArgs, err := source.MarshalArgs(uri, rng)
+	_, pgf, err := source.GetParsedFile(ctx, snapshot, fh, source.NarrowestPackage)
+	if err != nil {
+		return nil, errors.Errorf("getting file for Identifier: %w", err)
+	}
+	srng, err := pgf.Mapper.RangeToSpanRange(rng)
 	if err != nil {
 		return nil, err
 	}
-	var actions []protocol.CodeAction
-	for _, command := range []*source.Command{
-		source.CommandExtractFunction,
-		source.CommandExtractVariable,
-	} {
-		if !command.Applies(ctx, snapshot, fh, rng) {
-			continue
+	puri := protocol.URIFromSpanURI(uri)
+	var commands []protocol.Command
+	if _, ok, _ := source.CanExtractFunction(snapshot.FileSet(), srng, pgf.Src, pgf.File); ok {
+		cmd, err := command.NewApplyFixCommand("Extract to function", command.ApplyFixArgs{
+			URI:   puri,
+			Fix:   source.ExtractFunction,
+			Range: rng,
+		})
+		if err != nil {
+			return nil, err
 		}
+		commands = append(commands, cmd)
+	}
+	if _, _, ok, _ := source.CanExtractVariable(srng, pgf.File); ok {
+		cmd, err := command.NewApplyFixCommand("Extract variable", command.ApplyFixArgs{
+			URI:   puri,
+			Fix:   source.ExtractVariable,
+			Range: rng,
+		})
+		if err != nil {
+			return nil, err
+		}
+		commands = append(commands, cmd)
+	}
+	var actions []protocol.CodeAction
+	for _, cmd := range commands {
 		actions = append(actions, protocol.CodeAction{
-			Title: command.Title,
-			Kind:  protocol.RefactorExtract,
-			Command: &protocol.Command{
-				Command:   command.ID(),
-				Arguments: jsonArgs,
-			},
+			Title:   cmd.Title,
+			Kind:    protocol.RefactorExtract,
+			Command: &cmd,
 		})
 	}
 	return actions, nil
@@ -493,7 +332,7 @@ func extractionFixes(ctx context.Context, snapshot source.Snapshot, pkg source.P
 func documentChanges(fh source.VersionedFileHandle, edits []protocol.TextEdit) []protocol.TextDocumentEdit {
 	return []protocol.TextDocumentEdit{
 		{
-			TextDocument: protocol.VersionedTextDocumentIdentifier{
+			TextDocument: protocol.OptionalVersionedTextDocumentIdentifier{
 				Version: fh.Version(),
 				TextDocumentIdentifier: protocol.TextDocumentIdentifier{
 					URI: protocol.URIFromSpanURI(fh.URI()),
@@ -504,68 +343,67 @@ func documentChanges(fh source.VersionedFileHandle, edits []protocol.TextEdit) [
 	}
 }
 
-func moduleQuickFixes(ctx context.Context, snapshot source.Snapshot, fh source.VersionedFileHandle, diagnostics []protocol.Diagnostic) ([]protocol.CodeAction, error) {
-	var modFH source.VersionedFileHandle
-	switch fh.Kind() {
-	case source.Mod:
-		modFH = fh
-	case source.Go:
-		modURI := snapshot.GoModForFile(fh.URI())
-		if modURI == "" {
-			return nil, nil
-		}
-		var err error
-		modFH, err = snapshot.GetVersionedFile(ctx, modURI)
-		if err != nil {
-			return nil, err
-		}
-	}
-	errors, err := mod.ErrorsForMod(ctx, snapshot, modFH)
-	if err != nil {
-		return nil, err
-	}
-	var quickFixes []protocol.CodeAction
-	for _, e := range errors {
+func codeActionsMatchingDiagnostics(ctx context.Context, snapshot source.Snapshot, pdiags []protocol.Diagnostic, sdiags []*source.Diagnostic) ([]protocol.CodeAction, error) {
+	var actions []protocol.CodeAction
+	for _, sd := range sdiags {
 		var diag *protocol.Diagnostic
-		for _, d := range diagnostics {
-			if sameDiagnostic(d, e) {
-				diag = &d
+		for _, pd := range pdiags {
+			if sameDiagnostic(pd, sd) {
+				diag = &pd
 				break
 			}
 		}
 		if diag == nil {
 			continue
 		}
-		for _, fix := range e.SuggestedFixes {
-			action := protocol.CodeAction{
-				Title:       fix.Title,
-				Kind:        protocol.QuickFix,
-				Diagnostics: []protocol.Diagnostic{*diag},
-				Edit:        protocol.WorkspaceEdit{},
-				Command:     fix.Command,
-			}
-			for uri, edits := range fix.Edits {
-				if uri != modFH.URI() {
-					continue
-				}
-				action.Edit.DocumentChanges = append(action.Edit.DocumentChanges, protocol.TextDocumentEdit{
-					TextDocument: protocol.VersionedTextDocumentIdentifier{
-						Version: modFH.Version(),
-						TextDocumentIdentifier: protocol.TextDocumentIdentifier{
-							URI: protocol.URIFromSpanURI(modFH.URI()),
-						},
-					},
-					Edits: edits,
-				})
-			}
-			quickFixes = append(quickFixes, action)
+		diagActions, err := codeActionsForDiagnostic(ctx, snapshot, sd, diag)
+		if err != nil {
+			return nil, err
 		}
+		actions = append(actions, diagActions...)
+
 	}
-	return quickFixes, nil
+	return actions, nil
 }
 
-func sameDiagnostic(d protocol.Diagnostic, e *source.Error) bool {
-	return d.Message == e.Message && protocol.CompareRange(d.Range, e.Range) == 0 && d.Source == e.Category
+func codeActionsForDiagnostic(ctx context.Context, snapshot source.Snapshot, sd *source.Diagnostic, pd *protocol.Diagnostic) ([]protocol.CodeAction, error) {
+	var actions []protocol.CodeAction
+	for _, fix := range sd.SuggestedFixes {
+		action := protocol.CodeAction{
+			Title:   fix.Title,
+			Kind:    protocol.QuickFix,
+			Edit:    protocol.WorkspaceEdit{},
+			Command: fix.Command,
+		}
+		if pd != nil {
+			action.Diagnostics = []protocol.Diagnostic{*pd}
+		}
+		if sd.Analyzer != nil && sd.Analyzer.ActionKind != "" {
+			action.Kind = sd.Analyzer.ActionKind
+		}
+
+		for uri, edits := range fix.Edits {
+			fh, err := snapshot.GetVersionedFile(ctx, uri)
+			if err != nil {
+				return nil, err
+			}
+			action.Edit.DocumentChanges = append(action.Edit.DocumentChanges, protocol.TextDocumentEdit{
+				TextDocument: protocol.OptionalVersionedTextDocumentIdentifier{
+					Version: fh.Version(),
+					TextDocumentIdentifier: protocol.TextDocumentIdentifier{
+						URI: protocol.URIFromSpanURI(uri),
+					},
+				},
+				Edits: edits,
+			})
+		}
+		actions = append(actions, action)
+	}
+	return actions, nil
+}
+
+func sameDiagnostic(pd protocol.Diagnostic, sd *source.Diagnostic) bool {
+	return pd.Message == sd.Message && protocol.CompareRange(pd.Range, sd.Range) == 0 && pd.Source == string(sd.Source)
 }
 
 func goTest(ctx context.Context, snapshot source.Snapshot, uri span.URI, rng protocol.Range) ([]protocol.CodeAction, error) {
@@ -596,17 +434,13 @@ func goTest(ctx context.Context, snapshot source.Snapshot, uri span.URI, rng pro
 		return nil, nil
 	}
 
-	jsonArgs, err := source.MarshalArgs(uri, tests, benchmarks)
+	cmd, err := command.NewTestCommand("Run tests and benchmarks", protocol.URIFromSpanURI(uri), tests, benchmarks)
 	if err != nil {
 		return nil, err
 	}
 	return []protocol.CodeAction{{
-		Title: source.CommandTest.Name,
-		Kind:  protocol.GoTest,
-		Command: &protocol.Command{
-			Title:     source.CommandTest.Title,
-			Command:   source.CommandTest.ID(),
-			Arguments: jsonArgs,
-		},
+		Title:   cmd.Title,
+		Kind:    protocol.GoTest,
+		Command: &cmd,
 	}}, nil
 }
