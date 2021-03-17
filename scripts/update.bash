@@ -107,6 +107,8 @@ rm -r ./gopls/internal
 
 git add ./gopls
 
+# pull the latest tools since gopls depends on them
+GO111MODULE=on go get golang.org/x/tools@master
 GO111MODULE=on go mod tidy
 git add go.mod go.sum
 
