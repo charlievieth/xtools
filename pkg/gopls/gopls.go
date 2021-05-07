@@ -557,6 +557,47 @@ func (c *cmdClient) getFile(ctx context.Context, uri span.URI) *cmdFile {
 	return file
 }
 
+func (c *cmdClient) getFile_XXX(ctx context.Context, uri span.URI, modified string) *cmdFile {
+	file, found := c.files[uri]
+	if !found || file.err != nil {
+		file = &cmdFile{
+			uri: uri,
+		}
+		c.files[uri] = file
+	}
+	if file.mapper == nil {
+		fname := uri.Filename()
+		var content []byte
+		var err error
+		if modified != "" {
+			content = []byte(modified)
+		} else {
+			content, err = ioutil.ReadFile(fname)
+			if err != nil {
+				file.err = errors.Errorf("getFile: %v: %v", uri, err)
+				return file
+			}
+		}
+		f := c.fset.AddFile(fname, -1, len(content))
+		f.SetLinesForContent(content)
+		converter := span.NewContentConverter(fname, content)
+		file.mapper = &protocol.ColumnMapper{
+			URI:       uri,
+			Converter: converter,
+			Content:   content,
+		}
+	}
+	return file
+}
+
+// WARN: WIP
+func (c *connection) AddModifiedFile(ctx context.Context, uri span.URI, content string) *cmdFile {
+	c.Client.filesMu.Lock()
+	defer c.Client.filesMu.Unlock()
+
+	return nil
+}
+
 // TODO (CEV): support in-memory files
 func (c *connection) AddFile(ctx context.Context, uri span.URI) *cmdFile {
 	c.Client.filesMu.Lock()
