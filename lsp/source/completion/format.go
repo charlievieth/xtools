@@ -150,6 +150,11 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 		prefix = typeName + "(" + prefix
 		suffix = ")"
 	}
+
+	if cand.takeSlice {
+		suffix += "[:]"
+	}
+
 	// Add variadic "..." only if snippets if enabled or cand is not a function
 	if cand.variadic && (c.opts.snippets || !cand.expandFuncCall) {
 		suffix += "..."
@@ -158,7 +163,7 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 	if prefix != "" {
 		// If we are in a selector, add an edit to place prefix before selector.
 		if sel := enclosingSelector(c.path, c.pos); sel != nil {
-			edits, err := prependEdit(c.snapshot.FileSet(), c.mapper, sel, prefix)
+			edits, err := c.editText(sel.Pos(), sel.Pos(), prefix)
 			if err != nil {
 				return CompletionItem{}, err
 			}
@@ -229,7 +234,7 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 		return item, nil
 	}
 
-	hover, err := source.HoverInfo(ctx, pkg, obj, decl)
+	hover, err := source.HoverInfo(ctx, c.snapshot, pkg, obj, decl)
 	if err != nil {
 		event.Error(ctx, "failed to find Hover", err, tag.URI.Of(uri))
 		return item, nil
@@ -237,6 +242,14 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 	item.Documentation = hover.Synopsis
 	if c.opts.fullDocumentation {
 		item.Documentation = hover.FullDocumentation
+	}
+	// The desired pattern is `^// Deprecated`, but the prefix has been removed
+	if strings.HasPrefix(hover.FullDocumentation, "Deprecated") {
+		if c.snapshot.View().Options().CompletionTags {
+			item.Tags = []protocol.CompletionItemTag{protocol.ComplDeprecated}
+		} else if c.snapshot.View().Options().CompletionDeprecated {
+			item.Deprecated = true
+		}
 	}
 
 	return item, nil

@@ -7,7 +7,8 @@ package regtest
 import (
 	"testing"
 
-	. "github.com/charlievieth/xtools/gopls/regtest"
+	"github.com/charlievieth/xtools/gopls/hooks"
+	. "github.com/charlievieth/xtools/lsp/regtest"
 
 	"github.com/charlievieth/xtools/lsp/fake"
 	"github.com/charlievieth/xtools/lsp/protocol"
@@ -15,7 +16,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	Main(m)
+	Main(m, hooks.Options)
 }
 
 func TestEditFile(t *testing.T) {
@@ -617,19 +618,18 @@ func main() {
 `
 	WithOptions(
 		InGOPATH(),
+		EditorConfig{
+			Env: map[string]string{
+				"GO111MODULE": "auto",
+			},
+		},
 		Modes(Experimental), // module is in a subdirectory
 	).Run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("foo/main.go")
 		env.Await(env.DiagnosticAtRegexp("foo/main.go", `"blah"`))
-		if err := env.Sandbox.RunGoCommand(env.Ctx, "foo", "mod", []string{"init", "mod.com"}); err != nil {
+		if err := env.Sandbox.RunGoCommand(env.Ctx, "foo", "mod", []string{"init", "mod.com"}, true); err != nil {
 			t.Fatal(err)
 		}
-		env.Await(
-			OnceMet(
-				env.DoneWithChangeWatchedFiles(),
-				env.DiagnosticAtRegexp("foo/main.go", `"blah"`),
-			),
-		)
 		env.RegexpReplace("foo/main.go", `"blah"`, `"mod.com/blah"`)
 		env.Await(
 			EmptyDiagnostics("foo/main.go"),
@@ -661,6 +661,11 @@ func main() {
 `
 	WithOptions(
 		InGOPATH(),
+		EditorConfig{
+			Env: map[string]string{
+				"GO111MODULE": "auto",
+			},
+		},
 	).Run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("foo/main.go")
 		env.RemoveWorkspaceFile("foo/go.mod")

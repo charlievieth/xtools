@@ -99,7 +99,8 @@ func DefaultOptions() *Options {
 						protocol.SourceOrganizeImports: true,
 						protocol.QuickFix:              true,
 					},
-					Sum: {},
+					Sum:  {},
+					Tmpl: {},
 				},
 				SupportedCommands: commands,
 			},
@@ -107,6 +108,7 @@ func DefaultOptions() *Options {
 				BuildOptions: BuildOptions{
 					ExpandWorkspaceToModule:     true,
 					ExperimentalPackageCacheKey: true,
+					MemoryMode:                  ModeNormal,
 				},
 				UIOptions: UIOptions{
 					DiagnosticOptions: DiagnosticOptions{
@@ -129,8 +131,9 @@ func DefaultOptions() *Options {
 						SymbolStyle:    DynamicSymbols,
 					},
 					CompletionOptions: CompletionOptions{
-						Matcher:          Fuzzy,
-						CompletionBudget: 100 * time.Millisecond,
+						Matcher:                        Fuzzy,
+						CompletionBudget:               100 * time.Millisecond,
+						ExperimentalPostfixCompletions: true,
 					},
 					Codelenses: map[string]bool{
 						string(command.Generate):          true,
@@ -186,6 +189,8 @@ type ClientOptions struct {
 	SemanticTypes                     []string
 	SemanticMods                      []string
 	RelatedInformationSupported       bool
+	CompletionTags                    bool
+	CompletionDeprecated              bool
 }
 
 // ServerOptions holds LSP-specific configuration that is provided by the
@@ -212,10 +217,19 @@ type BuildOptions struct {
 	// The path prefix can be empty, so an initial `-` excludes everything.
 	//
 	// Examples:
+	//
 	// Exclude node_modules: `-node_modules`
+	//
 	// Include only project_a: `-` (exclude everything), `+project_a`
+	//
 	// Include only project_a, but not node_modules inside it: `-`, `+project_a`, `-project_a/node_modules`
 	DirectoryFilters []string
+
+	// MemoryMode controls the tradeoff `gopls` makes between memory usage and
+	// correctness.
+	//
+	// Values other than `Normal` are untested and may break in surprising ways.
+	MemoryMode MemoryMode `status:"experimental"`
 
 	// ExpandWorkspaceToModule instructs `gopls` to adjust the scope of the
 	// workspace to find the best available module root. `gopls` first looks for
@@ -228,6 +242,10 @@ type BuildOptions struct {
 	// ExperimentalWorkspaceModule opts a user into the experimental support
 	// for multi-module workspaces.
 	ExperimentalWorkspaceModule bool `status:"experimental"`
+
+	// ExperimentalTemplateSupport opts into the experimental support
+	// for template files.
+	ExperimentalTemplateSupport bool `status:"experimental"`
 
 	// ExperimentalPackageCacheKey controls whether to use a coarser cache key
 	// for package type information to increase cache hits. This setting removes
@@ -293,6 +311,10 @@ type CompletionOptions struct {
 	// Matcher sets the algorithm that is used when calculating completion
 	// candidates.
 	Matcher Matcher `status:"advanced"`
+
+	// ExperimentalPostfixCompletions enables artifical method snippets
+	// such as "someSlice.sort!".
+	ExperimentalPostfixCompletions bool `status:"experimental"`
 }
 
 type DocumentationOptions struct {
@@ -542,6 +564,16 @@ const (
 	Structured HoverKind = "Structured"
 )
 
+type MemoryMode string
+
+const (
+	ModeNormal MemoryMode = "Normal"
+	// In DegradeClosed mode, `gopls` will collect less information about
+	// packages without open files. As a result, features like Find
+	// References and Rename will miss results in such packages.
+	ModeDegradeClosed MemoryMode = "DegradeClosed"
+)
+
 type OptionResults []OptionResult
 
 type OptionResult struct {
@@ -622,6 +654,12 @@ func (o *Options) ForClientCapabilities(caps protocol.ClientCapabilities) {
 
 	// Check if the client supports diagnostic related information.
 	o.RelatedInformationSupported = caps.TextDocument.PublishDiagnostics.RelatedInformation
+	// Check if the client completion support incliudes tags (preferred) or deprecation
+	if caps.TextDocument.Completion.CompletionItem.TagSupport.ValueSet != nil {
+		o.CompletionTags = true
+	} else if caps.TextDocument.Completion.CompletionItem.DeprecatedSupport {
+		o.CompletionDeprecated = true
+	}
 }
 
 func (o *Options) Clone() *Options {
@@ -672,8 +710,8 @@ func (o *Options) Clone() *Options {
 	return result
 }
 
-func (o *Options) AddStaticcheckAnalyzer(a *analysis.Analyzer) {
-	o.StaticcheckAnalyzers[a.Name] = &Analyzer{Analyzer: a, Enabled: true}
+func (o *Options) AddStaticcheckAnalyzer(a *analysis.Analyzer, enabled bool) {
+	o.StaticcheckAnalyzers[a.Name] = &Analyzer{Analyzer: a, Enabled: enabled}
 }
 
 // enableAllExperiments turns on all of the experimental "off-by-default"
@@ -681,6 +719,8 @@ func (o *Options) AddStaticcheckAnalyzer(a *analysis.Analyzer) {
 // should be enabled in enableAllExperimentMaps.
 func (o *Options) enableAllExperiments() {
 	o.SemanticTokens = true
+	o.ExperimentalPostfixCompletions = true
+	o.ExperimentalTemplateSupport = true
 }
 
 func (o *Options) enableAllExperimentMaps() {
@@ -741,9 +781,16 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 				result.errorf("invalid filter %q, must start with + or -", filter)
 				return result
 			}
-			filters = append(filters, filepath.FromSlash(filter))
+			filters = append(filters, strings.TrimRight(filepath.FromSlash(filter), "/"))
 		}
 		o.DirectoryFilters = filters
+	case "memoryMode":
+		if s, ok := result.asOneOf(
+			string(ModeNormal),
+			string(ModeDegradeClosed),
+		); ok {
+			o.MemoryMode = MemoryMode(s)
+		}
 	case "completionDocumentation":
 		result.setBool(&o.CompletionDocumentation)
 	case "usePlaceholders":
@@ -852,8 +899,14 @@ func (o *Options) set(name string, value interface{}, seen map[string]struct{}) 
 	case "expandWorkspaceToModule":
 		result.setBool(&o.ExpandWorkspaceToModule)
 
+	case "experimentalPostfixCompletions":
+		result.setBool(&o.ExperimentalPostfixCompletions)
+
 	case "experimentalWorkspaceModule":
 		result.setBool(&o.ExperimentalWorkspaceModule)
+
+	case "experimentalTemplateSupport":
+		result.setBool(&o.ExperimentalTemplateSupport)
 
 	case "experimentalDiagnosticsDelay":
 		result.setDuration(&o.ExperimentalDiagnosticsDelay)
@@ -1080,7 +1133,7 @@ func typeErrorAnalyzers() map[string]*Analyzer {
 	return map[string]*Analyzer{
 		fillreturns.Analyzer.Name: {
 			Analyzer:   fillreturns.Analyzer,
-			ActionKind: protocol.SourceFixAll,
+			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
 			Enabled:    true,
 		},
 		nonewvars.Analyzer.Name: {
@@ -1105,7 +1158,7 @@ func convenienceAnalyzers() map[string]*Analyzer {
 			Analyzer:   fillstruct.Analyzer,
 			Fix:        FillStruct,
 			Enabled:    true,
-			ActionKind: protocol.RefactorRewrite,
+			ActionKind: []protocol.CodeActionKind{protocol.RefactorRewrite},
 		},
 	}
 }
@@ -1150,9 +1203,21 @@ func defaultAnalyzers() map[string]*Analyzer {
 		unusedwrite.Analyzer.Name:      {Analyzer: unusedwrite.Analyzer, Enabled: false},
 
 		// gofmt -s suite:
-		simplifycompositelit.Analyzer.Name: {Analyzer: simplifycompositelit.Analyzer, Enabled: true, ActionKind: protocol.SourceFixAll},
-		simplifyrange.Analyzer.Name:        {Analyzer: simplifyrange.Analyzer, Enabled: true, ActionKind: protocol.SourceFixAll},
-		simplifyslice.Analyzer.Name:        {Analyzer: simplifyslice.Analyzer, Enabled: true, ActionKind: protocol.SourceFixAll},
+		simplifycompositelit.Analyzer.Name: {
+			Analyzer:   simplifycompositelit.Analyzer,
+			Enabled:    true,
+			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
+		},
+		simplifyrange.Analyzer.Name: {
+			Analyzer:   simplifyrange.Analyzer,
+			Enabled:    true,
+			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
+		},
+		simplifyslice.Analyzer.Name: {
+			Analyzer:   simplifyslice.Analyzer,
+			Enabled:    true,
+			ActionKind: []protocol.CodeActionKind{protocol.SourceFixAll, protocol.QuickFix},
+		},
 	}
 }
 

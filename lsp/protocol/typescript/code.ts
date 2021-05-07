@@ -23,15 +23,13 @@ import * as u from './util';
 import { constName, getComments, goName, loc, strKind } from './util';
 
 var program: ts.Program;
-// eslint-disable-next-line no-unused-vars
-var checker: ts.TypeChecker;
 
 function parse() {
   // this won't complain if some fnames don't exist
   program = ts.createProgram(
     u.fnames,
     { target: ts.ScriptTarget.ES2018, module: ts.ModuleKind.CommonJS });
-  checker = program.getTypeChecker();  // finish type checking and assignment
+  program.getTypeChecker();  // finish type checking and assignment
 }
 
 // ----- collecting information for RPCs
@@ -56,7 +54,7 @@ function findRPCs(node: ts.Node) {
 
   if (!ts.isModuleBlock(node.body)) {
     throw new Error(
-      `expected ModuleBody got ${strKind(node.body)} at ${loc(node)}`);
+      `expected ModuleBlock got ${strKind(node.body)} at ${loc(node)}`);
   }
   let x: ts.ModuleBlock = node.body;
   // The story is to expect const method = 'textDocument/implementation'
@@ -103,7 +101,7 @@ function findRPCs(node: ts.Node) {
           ptypes.set(rpc, [nn.typeArguments[0], nn.typeArguments[1]]);
           break;
         default:
-          throw new Error(`${nn.typeArguments.length} at ${loc(nn)}`);
+          throw new Error(`${nn.typeArguments?.length} at ${loc(nn)}`);
       }
     }
   }
@@ -137,6 +135,7 @@ function setReceives() {
   receives.set('workspace/applyEdit', 'client');
   receives.set('textDocument/publishDiagnostics', 'client');
   receives.set('window/workDoneProgress/create', 'client');
+  receives.set('window/showDocument', 'client');
   receives.set('$/progress', 'client');
   // a small check
   receives.forEach((_, k) => {
@@ -426,7 +425,7 @@ function checkOnce() {
 
 // helper function to find underlying types
 // eslint-disable-next-line no-unused-vars
-function underlying(n: ts.Node, f: (n: ts.Node) => void) {
+function underlying(n: ts.Node | undefined, f: (n: ts.Node) => void) {
   if (!n) return;
   const ff = function (n: ts.Node) {
     underlying(n, f);
@@ -543,7 +542,9 @@ function sameType(a: ts.TypeNode, b: ts.TypeNode): boolean {
   }
   throw new Error(`546 sameType? ${strKind(a)} ${strKind(b)}`);
 }
-
+type CreateMutable<Type> = {
+  -readonly [Property in keyof Type]: Type[Property];
+};
 type propMap = Map<string, ts.PropertySignature>;
 function propMapSet(pm: propMap, name: string, v: ts.PropertySignature) {
   if (!pm.get(name)) {
@@ -557,16 +558,16 @@ function propMapSet(pm: propMap, name: string, v: ts.PropertySignature) {
     return;
   }
   if (ts.isTypeReferenceNode(a) && ts.isTypeLiteralNode(b)) {
-    const x = mergeTypeRefLit(name, a, b);
-    const fake: Object = v;
+    const x = mergeTypeRefLit(a, b);
+    const fake: CreateMutable<ts.PropertySignature> = v;
     fake['type'] = x;
     check(fake as ts.PropertySignature, '565');
     pm.set(name, fake as ts.PropertySignature);
     return;
   }
   if (ts.isTypeLiteralNode(a) && ts.isTypeLiteralNode(b)) {
-    const x = mergeTypeLitLit(name, a, b);
-    const fake: Object = v;
+    const x = mergeTypeLitLit(a, b);
+    const fake: CreateMutable<ts.PropertySignature> = v;
     fake['type'] = x;
     check(fake as ts.PropertySignature, '578');
     pm.set(name, fake as ts.PropertySignature);
@@ -575,7 +576,8 @@ function propMapSet(pm: propMap, name: string, v: ts.PropertySignature) {
   console.log(`577 ${pm.get(name).getText()}\n${v.getText()}`);
   throw new Error(`578 should merge ${strKind(a)} and ${strKind(b)} for ${name}`);
 }
-function addToProperties(pm: propMap, tn: ts.TypeNode, prefix = '') {
+function addToProperties(pm: propMap, tn: ts.TypeNode | undefined, prefix = '') {
+  if (!tn) return;
   if (ts.isTypeReferenceNode(tn)) {
     const d = seenTypes.get(goName(tn.typeName.getText()));
     if (tn.typeName.getText() === 'T') return;
@@ -602,9 +604,9 @@ function addToProperties(pm: propMap, tn: ts.TypeNode, prefix = '') {
     });
   }
 }
-function deepProperties(d: Data): propMap {
+function deepProperties(d: Data): propMap | undefined {
   let properties: propMap = new Map<string, ts.PropertySignature>();
-  if (!d.alias || !ts.isIntersectionTypeNode(d.alias)) return;
+  if (!d.alias || !ts.isIntersectionTypeNode(d.alias)) return undefined;
   d.alias.types.forEach((ts) => addToProperties(properties, ts));
   return properties;
 }
@@ -625,19 +627,19 @@ function mergeAlias(d: Data) {
   d.properties = ts.factory.createNodeArray(v);
 }
 
-function mergeTypeLitLit(name: string, a: ts.TypeLiteralNode, b: ts.TypeLiteralNode): ts.TypeLiteralNode {
+function mergeTypeLitLit(a: ts.TypeLiteralNode, b: ts.TypeLiteralNode): ts.TypeLiteralNode {
   const v = new Map<string, ts.TypeElement>(); // avoid duplicates
   a.members.forEach((te) => v.set(te.name.getText(), te));
   b.members.forEach((te) => v.set(te.name.getText(), te));
   const x: ts.TypeElement[] = [];
   v.forEach((te) => x.push(te));
-  const fake: Object = a;
-  fake['members'] = x;
+  const fake: CreateMutable<ts.TypeLiteralNode> = a;
+  fake['members'] = ts.factory.createNodeArray(x);
   check(fake as ts.TypeLiteralNode, '643');
   return fake as ts.TypeLiteralNode;
 }
 
-function mergeTypeRefLit(name: string, a: ts.TypeReferenceNode, b: ts.TypeLiteralNode): ts.TypeLiteralNode {
+function mergeTypeRefLit(a: ts.TypeReferenceNode, b: ts.TypeLiteralNode): ts.TypeLiteralNode {
   const d = seenTypes.get(goName(a.typeName.getText()));
   if (!d) throw new Error(`644 name ${a.typeName.getText()} not found`);
   const typ = d.me;
@@ -649,10 +651,10 @@ function mergeTypeRefLit(name: string, a: ts.TypeReferenceNode, b: ts.TypeLitera
   v.forEach((te) => x.push(te));
 
   const w = ts.factory.createNodeArray(x);
-  const fk: Object = b;
+  const fk: CreateMutable<ts.TypeLiteralNode> = b;
   fk['members'] = w;
-  fk['members']['pos'] = b.members.pos;
-  fk['members']['end'] = b.members.end;
+  (fk['members'] as { pos: number })['pos'] = b.members.pos;
+  (fk['members'] as { end: number })['end'] = b.members.end;
   check(fk as ts.TypeLiteralNode, '662');
   return fk as ts.TypeLiteralNode;
 }
@@ -801,9 +803,12 @@ function goTypeAlias(d: Data, nm: string) {
 }
 
 // return a go type and maybe an assocated javascript tag
-function goType(n: ts.TypeNode, nm: string): string {
+function goType(n: ts.TypeNode | undefined, nm: string): string {
+  if (!n) throw new Error(`goType undefined for ${nm}`);
   if (n.getText() == 'T') return 'interface{}';  // should check it's generic
   if (ts.isTypeReferenceNode(n)) {
+    // DocumentDiagnosticReportKind.unChanged (or .new) value is "new" or "unChanged"
+    if (n.getText().startsWith('DocumentDiagnostic')) return 'string';
     switch (n.getText()) {
       case 'integer': return 'int32';
       case 'uinteger': return 'uint32';
@@ -899,8 +904,12 @@ function goUnionType(n: ts.UnionTypeNode, nm: string): string {
       if (a == 'TypeLiteral' && nm == 'TextDocumentContentChangeEvent') {
         return `${goType(n.types[0], nm)}`;
       }
-      console.log(`911 ${n.types[1].getText()} ${loc(n.types[1])}`);
-      throw new Error(`912 ${nm}: a:${a} b:${b} ${n.getText()} ${loc(n)}`);
+      if (a == 'TypeLiteral' && b === 'TypeLiteral') {
+        // DocumentDiagnosticReport
+        // the first one includes the second one
+        return `${goType(n.types[0], '9d')}`;
+      }
+      throw new Error(`911 ${nm}: a:${a}/${goType(n.types[0], '9a')} b:${b}/${goType(n.types[1], '9b')} ${loc(n)}`);
     }
     case 3: {
       const aa = strKind(n.types[0]);
@@ -914,18 +923,20 @@ function goUnionType(n: ts.UnionTypeNode, nm: string): string {
       if (nm == 'textDocument/documentSymbol') {
         return `[]interface{} ${help}`;
       }
-      if (aa == 'TypeReference' && bb == 'ArrayType' && cc == 'NullKeyword') {
+      if (aa == 'TypeReference' && bb == 'ArrayType' && (cc == 'NullKeyword' || cc === 'LiteralType')) {
         return `${goType(n.types[0], 'd')} ${help}`;
       }
       if (aa == 'TypeReference' && bb == aa && cc == 'ArrayType') {
         // should check that this is Hover.Contents
         return `${goType(n.types[0], 'e')} ${help}`;
       }
-      if (aa == 'ArrayType' && bb == 'TypeReference' && cc == 'NullKeyword') {
+      if (aa == 'ArrayType' && bb == 'TypeReference' && (cc == 'NullKeyword' || cc === 'LiteralType')) {
         // check this is nm == 'textDocument/completion'
         return `${goType(n.types[1], 'f')} ${help}`;
       }
       if (aa == 'LiteralType' && bb == aa && cc == aa) return `string ${help}`;
+      // keep this for diagnosing unexpected interface{} results
+      // console.log(`931, interface{} for ${aa}/${goType(n.types[0], 'g')},${bb}/${goType(n.types[1], 'h')},${cc}/${goType(n.types[2], 'i')} ${nm}`);
       break;
     }
     case 4:
@@ -1037,6 +1048,7 @@ function isStructType(te: ts.TypeNode): boolean {
     case 'TypeReference': {
       if (!ts.isTypeReferenceNode(te)) throw new Error(`1047 impossible ${strKind(te)}`);
       const d = seenTypes.get(goName(te.typeName.getText()));
+      if (d === undefined) return false;
       if (d.properties.length > 1) return true;
       // alias or interface with a single property (The alias is Uinteger, which we ignore later)
       if (d.alias) return false;
@@ -1204,6 +1216,14 @@ function goReq(side: side, m: string) {
     if err := json.Unmarshal(r.Params(), &params); err != nil {
       return true, sendParseError(ctx, reply, err)
     }`;
+    if (a === 'ParamInitialize') {
+      case1 = `var params ${a}
+    if err := json.Unmarshal(r.Params(), &params); err != nil {
+      if _, ok := err.(*json.UnmarshalTypeError); !ok {
+        return true, sendParseError(ctx, reply, err)
+      }
+    }`;
+    }
   }
   const arg2 = a == '' ? '' : ', &params';
   // if case2 is not explicitly typed string, typescript makes it a union of strings
@@ -1251,8 +1271,7 @@ function methodName(m: string): string {
     x = prefix + suffix;
   }
   if (seenNames.has(x)) {
-    // Resolve, ResolveCodeLens, ResolveDocumentLink
-    if (!x.startsWith('Resolve')) throw new Error(`expected Resolve, not ${x}`);
+    // various Resolve and Diagnostic
     x += m[0].toUpperCase() + m.substring(1, i);
   }
   seenNames.add(x);
@@ -1305,8 +1324,8 @@ function output(side: side) {
     side.fd = fs.openSync(side.outputFile, 'w');
   }
   const f = function (s: string) {
-    fs.writeSync(side.fd, s);
-    fs.writeSync(side.fd, '\n');
+    fs.writeSync(side.fd!, s);
+    fs.writeSync(side.fd!, '\n');
   };
   f(u.computeHeader(false));
   f(`

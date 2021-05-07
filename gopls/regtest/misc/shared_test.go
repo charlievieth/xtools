@@ -7,7 +7,7 @@ package misc
 import (
 	"testing"
 
-	. "github.com/charlievieth/xtools/gopls/regtest"
+	. "github.com/charlievieth/xtools/lsp/regtest"
 )
 
 const sharedProgram = `

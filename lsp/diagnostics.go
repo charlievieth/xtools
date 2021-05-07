@@ -19,6 +19,7 @@ import (
 	"github.com/charlievieth/xtools/lsp/mod"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
+	"github.com/charlievieth/xtools/lsp/template"
 	"github.com/charlievieth/xtools/span"
 	"github.com/charlievieth/xtools/xcontext"
 	errors "golang.org/x/xerrors"
@@ -121,6 +122,7 @@ func (s *Server) diagnoseSnapshot(snapshot source.Snapshot, changedURIs []span.U
 func (s *Server) diagnoseChangedFiles(ctx context.Context, snapshot source.Snapshot, uris []span.URI, onDisk bool) {
 	ctx, done := event.Start(ctx, "Server.diagnoseChangedFiles", tag.Snapshot.Of(snapshot.ID()))
 	defer done()
+
 	packages := make(map[source.Package]struct{})
 	for _, uri := range uris {
 		// If the change is only on-disk and the file is not open, don't
@@ -131,6 +133,11 @@ func (s *Server) diagnoseChangedFiles(ctx context.Context, snapshot source.Snaps
 		// If the file is not known to the snapshot (e.g., if it was deleted),
 		// don't diagnose it.
 		if snapshot.FindFile(uri) == nil {
+			continue
+		}
+		// Don't call PackagesForFile for builtin.go, as it results in a
+		// command-line-arguments load.
+		if snapshot.IsBuiltin(ctx, uri) {
 			continue
 		}
 		pkgs, err := snapshot.PackagesForFile(ctx, uri, source.TypecheckFull)
@@ -202,6 +209,12 @@ func (s *Server) diagnose(ctx context.Context, snapshot source.Snapshot, forceAn
 	// will still be shown as a ShowMessage. If there is no error, any running
 	// error progress reports will be closed.
 	s.showCriticalErrorStatus(ctx, snapshot, criticalErr)
+
+	// There may be .tmpl files.
+	for _, f := range snapshot.Templates() {
+		diags := template.Diagnose(f)
+		s.storeDiagnostics(snapshot, f.URI(), typeCheckSource, diags)
+	}
 
 	// If there are no workspace packages, there is nothing to diagnose and
 	// there are no orphaned files.
@@ -285,15 +298,25 @@ func (s *Server) diagnosePkg(ctx context.Context, snapshot source.Snapshot, pkg 
 		if err != nil {
 			event.Error(ctx, "warning: gc details", err, tag.Snapshot.Of(snapshot.ID()), tag.Package.Of(pkg.ID()))
 		}
-		for id, diags := range gcReports {
-			fh := snapshot.FindFile(id.URI)
-			// Don't publish gc details for unsaved buffers, since the underlying
-			// logic operates on the file on disk.
-			if fh == nil || !fh.Saved() {
-				continue
+		s.gcOptimizationDetailsMu.Lock()
+		_, enableGCDetails := s.gcOptimizationDetails[pkg.ID()]
+
+		// NOTE(golang/go#44826): hold the gcOptimizationDetails lock, and re-check
+		// whether gc optimization details are enabled, while storing gc_details
+		// results. This ensures that the toggling of GC details and clearing of
+		// diagnostics does not race with storing the results here.
+		if enableGCDetails {
+			for id, diags := range gcReports {
+				fh := snapshot.FindFile(id.URI)
+				// Don't publish gc details for unsaved buffers, since the underlying
+				// logic operates on the file on disk.
+				if fh == nil || !fh.Saved() {
+					continue
+				}
+				s.storeDiagnostics(snapshot, id.URI, gcDetailsSource, diags)
 			}
-			s.storeDiagnostics(snapshot, id.URI, gcDetailsSource, diags)
 		}
+		s.gcOptimizationDetailsMu.Unlock()
 	}
 }
 
@@ -381,6 +404,10 @@ func (s *Server) showCriticalErrorStatus(ctx context.Context, snapshot source.Sn
 // a warning, suggesting that the user check the file for build tags.
 func (s *Server) checkForOrphanedFile(ctx context.Context, snapshot source.Snapshot, fh source.VersionedFileHandle) *source.Diagnostic {
 	if fh.Kind() != source.Go {
+		return nil
+	}
+	// builtin files won't have a package, but they are never orphaned.
+	if snapshot.IsBuiltin(ctx, fh.URI()) {
 		return nil
 	}
 	pkgs, err := snapshot.PackagesForFile(ctx, fh.URI(), source.TypecheckWorkspace)

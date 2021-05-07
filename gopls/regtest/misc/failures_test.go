@@ -7,7 +7,7 @@ package misc
 import (
 	"testing"
 
-	. "github.com/charlievieth/xtools/gopls/regtest"
+	. "github.com/charlievieth/xtools/lsp/regtest"
 )
 
 // This test passes (TestHoverOnError in definition_test.go) without

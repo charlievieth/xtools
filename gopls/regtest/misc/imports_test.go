@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	. "github.com/charlievieth/xtools/gopls/regtest"
+	. "github.com/charlievieth/xtools/lsp/regtest"
 
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/testenv"
@@ -74,7 +74,7 @@ func main() {
 	Run(t, "", func(t *testing.T, env *Env) {
 		env.CreateBuffer("main.go", vim1)
 		env.OrganizeImports("main.go")
-		actions := env.CodeAction("main.go")
+		actions := env.CodeAction("main.go", nil)
 		if len(actions) > 0 {
 			got := env.Editor.BufferText("main.go")
 			t.Errorf("unexpected actions %#v", actions)
@@ -107,7 +107,7 @@ func main() {
 	Run(t, "", func(t *testing.T, env *Env) {
 		env.CreateBuffer("main.go", vim2)
 		env.OrganizeImports("main.go")
-		actions := env.CodeAction("main.go")
+		actions := env.CodeAction("main.go", nil)
 		if len(actions) > 0 {
 			t.Errorf("unexpected actions %#v", actions)
 		}

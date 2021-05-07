@@ -7,9 +7,10 @@ package misc
 import (
 	"testing"
 
-	"github.com/charlievieth/xtools/gopls/regtest"
+	"github.com/charlievieth/xtools/gopls/hooks"
+	"github.com/charlievieth/xtools/lsp/regtest"
 )
 
 func TestMain(m *testing.M) {
-	regtest.Main(m)
+	regtest.Main(m, hooks.Options)
 }

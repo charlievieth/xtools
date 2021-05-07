@@ -69,6 +69,9 @@ type Snapshot interface {
 	// workspace.
 	IgnoredFile(uri span.URI) bool
 
+	// Templates returns the .tmpl files
+	Templates() map[span.URI]VersionedFileHandle
+
 	// ParseGo returns the parsed AST for the file.
 	// If the file is not available, returns nil and an error.
 	ParseGo(ctx context.Context, fh FileHandle, mode ParseMode) (*ParsedGoFile, error)
@@ -125,8 +128,11 @@ type Snapshot interface {
 	// GoModForFile returns the URI of the go.mod file for the given URI.
 	GoModForFile(uri span.URI) span.URI
 
-	// BuiltinPackage returns information about the special builtin package.
-	BuiltinPackage(ctx context.Context) (*BuiltinPackage, error)
+	// BuiltinFile returns information about the special builtin package.
+	BuiltinFile(ctx context.Context) (*ParsedGoFile, error)
+
+	// IsBuiltin reports whether uri is part of the builtin package.
+	IsBuiltin(ctx context.Context, uri span.URI) bool
 
 	// PackagesForFile returns the packages that this file belongs to, checked
 	// in mode.
@@ -254,11 +260,6 @@ type View interface {
 type FileSource interface {
 	// GetFile returns the FileHandle for a given URI.
 	GetFile(ctx context.Context, uri span.URI) (FileHandle, error)
-}
-
-type BuiltinPackage struct {
-	Package    *ast.Package
-	ParsedFile *ParsedGoFile
 }
 
 // A ParsedGoFile contains the results of parsing a Go file.
@@ -511,6 +512,8 @@ const (
 	Mod
 	// Sum is a go.sum file.
 	Sum
+	// Tmpl is a template file.
+	Tmpl
 )
 
 // Analyzer represents a go/analysis analyzer with some boolean properties
@@ -531,7 +534,7 @@ type Analyzer struct {
 
 	// ActionKind is the kind of code action this analyzer produces. If
 	// unspecified the type defaults to quickfix.
-	ActionKind protocol.CodeActionKind
+	ActionKind []protocol.CodeActionKind
 }
 
 func (a Analyzer) IsEnabled(view View) bool {

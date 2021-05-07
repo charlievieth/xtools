@@ -11,18 +11,24 @@ import (
 	"github.com/charlievieth/xtools/lsp/debug/tag"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
+	"github.com/charlievieth/xtools/lsp/template"
 )
 
 func (s *Server) documentSymbol(ctx context.Context, params *protocol.DocumentSymbolParams) ([]interface{}, error) {
 	ctx, done := event.Start(ctx, "lsp.Server.documentSymbol")
 	defer done()
 
-	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, source.Go)
+	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, source.UnknownKind)
 	defer release()
 	if !ok {
 		return []interface{}{}, err
 	}
-	docSymbols, err := source.DocumentSymbols(ctx, snapshot, fh)
+	var docSymbols []protocol.DocumentSymbol
+	if fh.Kind() == source.Tmpl {
+		docSymbols, err = template.DocumentSymbols(snapshot, fh)
+	} else {
+		docSymbols, err = source.DocumentSymbols(ctx, snapshot, fh)
+	}
 	if err != nil {
 		event.Error(ctx, "DocumentSymbols failed", err, tag.URI.Of(fh.URI()))
 		return []interface{}{}, nil

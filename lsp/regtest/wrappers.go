@@ -156,7 +156,7 @@ func (e *Env) SaveBufferWithoutActions(name string) {
 }
 
 // GoToDefinition goes to definition in the editor, calling t.Fatal on any
-// error.
+// error. It returns the path and position of the resulting jump.
 func (e *Env) GoToDefinition(name string, pos fake.Pos) (string, fake.Pos) {
 	e.T.Helper()
 	n, p, err := e.Editor.GoToDefinition(e.Ctx, name, pos)
@@ -201,6 +201,14 @@ func (e *Env) ApplyQuickFixes(path string, diagnostics []protocol.Diagnostic) {
 	}
 }
 
+// ApplyCodeAction applies the given code action.
+func (e *Env) ApplyCodeAction(action protocol.CodeAction) {
+	e.T.Helper()
+	if err := e.Editor.ApplyCodeAction(e.Ctx, action); err != nil {
+		e.T.Fatal(err)
+	}
+}
+
 // GetQuickFixes returns the available quick fix code actions.
 func (e *Env) GetQuickFixes(path string, diagnostics []protocol.Diagnostic) []protocol.CodeAction {
 	e.T.Helper()
@@ -230,7 +238,16 @@ func (e *Env) DocumentLink(name string) []protocol.DocumentLink {
 	return links
 }
 
-func checkIsFatal(t *testing.T, err error) {
+func (e *Env) DocumentHighlight(name string, pos fake.Pos) []protocol.DocumentHighlight {
+	e.T.Helper()
+	highlights, err := e.Editor.DocumentHighlight(e.Ctx, name, pos)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	return highlights
+}
+
+func checkIsFatal(t testing.TB, err error) {
 	t.Helper()
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatal(err)
@@ -262,7 +279,7 @@ func (e *Env) RunGenerate(dir string) {
 // directory.
 func (e *Env) RunGoCommand(verb string, args ...string) {
 	e.T.Helper()
-	if err := e.Sandbox.RunGoCommand(e.Ctx, "", verb, args); err != nil {
+	if err := e.Sandbox.RunGoCommand(e.Ctx, "", verb, args, true); err != nil {
 		e.T.Fatal(err)
 	}
 }
@@ -271,7 +288,7 @@ func (e *Env) RunGoCommand(verb string, args ...string) {
 // relative directory of the sandbox.
 func (e *Env) RunGoCommandInDir(dir, verb string, args ...string) {
 	e.T.Helper()
-	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, verb, args); err != nil {
+	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, verb, args, true); err != nil {
 		e.T.Fatal(err)
 	}
 }
@@ -281,7 +298,7 @@ func (e *Env) RunGoCommandInDir(dir, verb string, args ...string) {
 func (e *Env) DumpGoSum(dir string) {
 	e.T.Helper()
 
-	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, "list", []string{"-mod=mod", "..."}); err != nil {
+	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, "list", []string{"-mod=mod", "..."}, true); err != nil {
 		e.T.Fatal(err)
 	}
 	sumFile := path.Join(dir, "/go.sum")
@@ -388,9 +405,9 @@ func (e *Env) AcceptCompletion(path string, pos fake.Pos, item protocol.Completi
 
 // CodeAction calls testDocument/codeAction for the given path, and calls
 // t.Fatal if there are errors.
-func (e *Env) CodeAction(path string) []protocol.CodeAction {
+func (e *Env) CodeAction(path string, diagnostics []protocol.Diagnostic) []protocol.CodeAction {
 	e.T.Helper()
-	actions, err := e.Editor.CodeAction(e.Ctx, path, nil)
+	actions, err := e.Editor.CodeAction(e.Ctx, path, nil, diagnostics)
 	if err != nil {
 		e.T.Fatal(err)
 	}

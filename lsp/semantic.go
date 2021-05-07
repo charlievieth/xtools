@@ -19,8 +19,12 @@ import (
 	"github.com/charlievieth/xtools/event"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
+	"github.com/charlievieth/xtools/lsp/template"
 	errors "golang.org/x/xerrors"
 )
+
+// reject full semantic token requests for large files
+const maxFullFileSize int = 100000
 
 func (s *Server) semanticTokensFull(ctx context.Context, p *protocol.SemanticTokensParams) (*protocol.SemanticTokens, error) {
 	ret, err := s.computeSemanticTokens(ctx, p.TextDocument, nil)
@@ -45,7 +49,8 @@ func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocu
 	ans := protocol.SemanticTokens{
 		Data: []uint32{},
 	}
-	snapshot, _, ok, release, err := s.beginFileRequest(ctx, td.URI, source.Go)
+	kind := source.DetectLanguage("", td.URI.SpanURI().Filename())
+	snapshot, _, ok, release, err := s.beginFileRequest(ctx, td.URI, kind)
 	defer release()
 	if !ok {
 		return nil, err
@@ -55,6 +60,23 @@ func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocu
 		// return an error, so if the option changes
 		// the client won't remember the wrong answer
 		return nil, errors.Errorf("semantictokens are disabled")
+	}
+	if kind == source.Tmpl {
+		// this is a little cumbersome to avoid both exporting 'encoded' and its methods
+		// and to avoid import cycles
+		e := &encoded{
+			ctx:      ctx,
+			rng:      rng,
+			tokTypes: s.session.Options().SemanticTypes,
+			tokMods:  s.session.Options().SemanticMods,
+		}
+		add := func(line, start uint32, len uint32) {
+			e.add(line, start, len, tokMacro, nil)
+		}
+		data := func() ([]uint32, error) {
+			return e.Data()
+		}
+		return template.SemanticTokens(ctx, snapshot, td.URI.SpanURI(), add, data)
 	}
 	pkg, err := snapshot.PackageForFile(ctx, td.URI.SpanURI(), source.TypecheckFull, source.WidestPackage)
 	if err != nil {
@@ -67,6 +89,11 @@ func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocu
 	}
 	if pgf.ParseErr != nil {
 		return nil, pgf.ParseErr
+	}
+	if rng == nil && len(pgf.Src) > maxFullFileSize {
+		err := fmt.Errorf("semantic tokens: file %s too large for full (%d>%d)",
+			td.URI.SpanURI().Filename(), len(pgf.Src), maxFullFileSize)
+		return nil, err
 	}
 	e := &encoded{
 		ctx:      ctx,
@@ -107,6 +134,15 @@ func (e *encoded) semantics() {
 		}
 		ast.Inspect(d, inspect)
 	}
+	for _, cg := range f.Comments {
+		for _, c := range cg.List {
+			if !strings.Contains(c.Text, "\n") {
+				e.token(c.Pos(), len(c.Text), tokComment, nil)
+				continue
+			}
+			e.multiline(c.Pos(), c.End(), c.Text, tokComment)
+		}
+	}
 }
 
 type tokenType string
@@ -124,6 +160,8 @@ const (
 	tokString    tokenType = "string"
 	tokNumber    tokenType = "number"
 	tokOperator  tokenType = "operator"
+
+	tokMacro tokenType = "macro" // for templates
 )
 
 func (e *encoded) token(start token.Pos, leng int, typ tokenType, mods []string) {
@@ -216,9 +254,9 @@ func (e *encoded) inspector(n ast.Node) bool {
 	case *ast.AssignStmt:
 		e.token(x.TokPos, len(x.Tok.String()), tokOperator, nil)
 	case *ast.BasicLit:
-		// if it extends across a line, skip it
-		// better would be to mark each line as string TODO(pjw)
 		if strings.Contains(x.Value, "\n") {
+			// has to be a string
+			e.multiline(x.Pos(), x.End(), x.Value, tokString)
 			break
 		}
 		ln := len(x.Value)
@@ -394,15 +432,19 @@ func (e *encoded) ident(x *ast.Ident) {
 		// nothing to map it to
 	case *types.Nil:
 		// nil is a predeclared identifier
-		e.token(x.Pos(), len("nil"), tokVariable, []string{"readonly"})
+		e.token(x.Pos(), len("nil"), tokVariable, []string{"readonly", "defaultLibrary"})
 	case *types.PkgName:
 		e.token(x.Pos(), len(x.Name), tokNamespace, nil)
 	case *types.TypeName:
-		e.token(x.Pos(), len(x.String()), tokType, nil)
+		var mods []string
+		if _, ok := y.Type().(*types.Basic); ok {
+			mods = []string{"defaultLibrary"}
+		}
+		e.token(x.Pos(), len(x.String()), tokType, mods)
 	case *types.Var:
 		e.token(x.Pos(), len(x.Name), tokVariable, nil)
 	default:
-		// replace with panic after extensive testing
+		// can't happen
 		if use == nil {
 			msg := fmt.Sprintf("%#v/%#v %#v %#v", x, x.Obj, e.ti.Defs[x], e.ti.Uses[x])
 			e.unexpected(msg)
@@ -413,6 +455,18 @@ func (e *encoded) ident(x *ast.Ident) {
 			e.unexpected(fmt.Sprintf("%s %T", x.String(), use))
 		}
 	}
+}
+
+func isDeprecated(n *ast.CommentGroup) bool {
+	if n == nil {
+		return false
+	}
+	for _, c := range n.List {
+		if strings.HasPrefix(c.Text, "// Deprecated") {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
@@ -426,6 +480,9 @@ func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
 			}
 			return "variable", mods
 		case *ast.GenDecl:
+			if isDeprecated(y.Doc) {
+				mods = append(mods, "deprecated")
+			}
 			if y.Tok == token.CONST {
 				mods = append(mods, "readonly")
 			}
@@ -433,6 +490,9 @@ func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
 		case *ast.FuncDecl:
 			// If x is immediately under a FuncDecl, it is a function or method
 			if i == len(e.stack)-2 {
+				if isDeprecated(y.Doc) {
+					mods = append(mods, "deprecated")
+				}
 				if y.Recv != nil {
 					return tokMember, mods
 				}
@@ -447,13 +507,46 @@ func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
 		case *ast.InterfaceType:
 			return tokMember, mods
 		case *ast.TypeSpec:
+			// GenDecl/Typespec/FuncType/FieldList/Field/Ident
+			// (type A func(b uint64)) (err error)
+			// b and err should not be tokType, but tokVaraible
+			// and in GenDecl/TpeSpec/StructType/FieldList/Field/Ident
+			// (type A struct{b uint64})
+			fldm := e.stack[len(e.stack)-2]
+			if _, ok := fldm.(*ast.Field); ok {
+				return tokVariable, mods
+			}
 			return tokType, mods
 		}
 	}
-	// panic after extensive testing
+	// can't happen
 	msg := fmt.Sprintf("failed to find the decl for %s", e.pgf.Tok.PositionFor(x.Pos(), false))
 	e.unexpected(msg)
 	return "", []string{""}
+}
+
+func (e *encoded) multiline(start, end token.Pos, val string, tok tokenType) {
+	f := e.fset.File(start)
+	// the hard part is finding the lengths of lines. include the \n
+	leng := func(line int) int {
+		n := f.LineStart(line)
+		if line >= f.LineCount() {
+			return f.Size() - int(n)
+		}
+		return int(f.LineStart(line+1) - n)
+	}
+	spos := e.fset.PositionFor(start, false)
+	epos := e.fset.PositionFor(end, false)
+	sline := spos.Line
+	eline := epos.Line
+	// first line is from spos.Column to end
+	e.token(start, leng(sline)-spos.Column, tok, nil) // leng(sline)-1 - (spos.Column-1)
+	for i := sline + 1; i < eline; i++ {
+		// intermediate lines are from 1 to end
+		e.token(f.LineStart(i), leng(i)-1, tok, nil) // avoid the newline
+	}
+	// last line is from 1 to epos.Column
+	e.token(f.LineStart(eline), epos.Column-1, tok, nil) // columns are 1-based
 }
 
 // findKeyword finds a keyword rather than guessing its location
@@ -478,7 +571,7 @@ func (e *encoded) init() error {
 	}
 	span, err := e.pgf.Mapper.RangeSpan(*e.rng)
 	if err != nil {
-		return errors.Errorf("range span error for %s", e.pgf.File.Name)
+		return errors.Errorf("range span (%v) error for %s", err, e.pgf.File.Name)
 	}
 	e.end = e.start + token.Pos(span.End().Offset())
 	e.start += token.Pos(span.Start().Offset())
@@ -543,11 +636,9 @@ func (e *encoded) importSpec(d *ast.ImportSpec) {
 	e.token(start, len(nm), tokNamespace, nil)
 }
 
-// panic on unexpected state
+// log unexpected state
 func (e *encoded) unexpected(msg string) {
-	log.Print(msg)
-	log.Print(e.strStack())
-	panic(msg)
+	event.Error(e.ctx, e.strStack(), errors.New(msg))
 }
 
 // SemType returns a string equivalent of the type, for gopls semtok

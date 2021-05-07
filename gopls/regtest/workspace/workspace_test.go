@@ -12,7 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	. "github.com/charlievieth/xtools/gopls/regtest"
+	"github.com/charlievieth/xtools/gopls/hooks"
+	. "github.com/charlievieth/xtools/lsp/regtest"
 
 	"github.com/charlievieth/xtools/lsp/command"
 	"github.com/charlievieth/xtools/lsp/fake"
@@ -21,7 +22,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	Main(m)
+	Main(m, hooks.Options)
 }
 
 const workspaceProxy = `
@@ -237,6 +238,66 @@ func Hello() int {
 			env.DiagnosticAtRegexp("moda/a/a.go", "x"),
 			env.DiagnosticAtRegexp("modb/b/b.go", "x"),
 			env.NoDiagnosticAtRegexp("moda/a/a.go", `"b.com/b"`),
+		)
+	})
+}
+
+func TestMultiModuleWithExclude(t *testing.T) {
+	testenv.NeedsGo1Point(t, 16)
+
+	const proxy = `
+-- c.com@v1.2.3/go.mod --
+module c.com
+
+go 1.12
+
+require b.com v1.2.3
+-- c.com@v1.2.3/blah/blah.go --
+package blah
+
+func SaySomething() {
+	fmt.Println("something")
+}
+-- b.com@v1.2.3/go.mod --
+module b.com
+
+go 1.12
+-- b.com@v1.2.4/b/b.go --
+package b
+
+func Hello() {}
+-- b.com@v1.2.4/go.mod --
+module b.com
+
+go 1.12
+-- b.com@v1.2.4/b/b.go --
+package b
+
+func Hello() {}
+`
+	const multiModule = `
+-- go.mod --
+module a.com
+
+require c.com v1.2.3
+
+exclude b.com v1.2.3
+-- go.sum --
+c.com v1.2.3 h1:n07Dz9fYmpNqvZMwZi5NEqFcSHbvLa9lacMX+/g25tw=
+c.com v1.2.3/go.mod h1:/4TyYgU9Nu5tA4NymP5xyqE8R2VMzGD3TbJCwCOvHAg=
+-- main.go --
+package a
+
+func main() {
+	var x int
+}
+`
+	WithOptions(
+		ProxyFiles(proxy),
+		Modes(Experimental),
+	).Run(t, multiModule, func(t *testing.T, env *Env) {
+		env.Await(
+			env.DiagnosticAtRegexp("main.go", "x"),
 		)
 	})
 }

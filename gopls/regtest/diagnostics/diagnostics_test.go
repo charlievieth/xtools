@@ -8,9 +8,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os/exec"
 	"testing"
 
-	. "github.com/charlievieth/xtools/gopls/regtest"
+	"github.com/charlievieth/xtools/gopls/hooks"
+	. "github.com/charlievieth/xtools/lsp/regtest"
 
 	"github.com/charlievieth/xtools/lsp"
 	"github.com/charlievieth/xtools/lsp/fake"
@@ -19,7 +21,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	Main(m)
+	Main(m, hooks.Options)
 }
 
 // Use mod.com for all go.mod files due to golang/go#35230.
@@ -299,7 +301,7 @@ func Hello() {
 			env.Await(
 				env.DiagnosticAtRegexp("main.go", `"mod.com/bob"`),
 			)
-			if err := env.Sandbox.RunGoCommand(env.Ctx, "", "mod", []string{"init", "mod.com"}); err != nil {
+			if err := env.Sandbox.RunGoCommand(env.Ctx, "", "mod", []string{"init", "mod.com"}, true); err != nil {
 				t.Fatal(err)
 			}
 			env.Await(
@@ -572,12 +574,8 @@ hi mom
 			WithOptions(EditorConfig{
 				Env: map[string]string{"GO111MODULE": go111module},
 			}).Run(t, files, func(t *testing.T, env *Env) {
-				env.OpenFile("hello.txt")
 				env.Await(
-					OnceMet(
-						env.DoneWithOpen(),
-						NoShowMessage(),
-					),
+					NoOutstandingWork(),
 				)
 			})
 		})
@@ -603,7 +601,14 @@ func main() {
 	fmt.Println("")
 }
 `
-	WithOptions(InGOPATH()).Run(t, collision, func(t *testing.T, env *Env) {
+	WithOptions(
+		InGOPATH(),
+		EditorConfig{
+			Env: map[string]string{
+				"GO111MODULE": "off",
+			},
+		},
+	).Run(t, collision, func(t *testing.T, env *Env) {
 		env.OpenFile("x/x.go")
 		env.Await(
 			env.DiagnosticAtRegexpWithMessage("x/x.go", `^`, "found packages main (main.go) and x (x.go)"),
@@ -894,24 +899,6 @@ package foo_
 				env.DoneWithSave(),
 				NoDiagnostics("foo/foo.go"),
 			),
-		)
-	})
-}
-
-// Reproduces golang/go#40825.
-func TestEmptyGOPATHXTest_40825(t *testing.T) {
-	const files = `
--- x.go --
-package x
--- x_test.go --
-`
-
-	WithOptions(InGOPATH()).Run(t, files, func(t *testing.T, env *Env) {
-		env.OpenFile("x_test.go")
-		env.EditBuffer("x_test.go", fake.NewEdit(0, 0, 0, 0, "pack"))
-		env.Await(
-			env.DoneWithChange(),
-			NoShowMessage(),
 		)
 	})
 }
@@ -1395,7 +1382,15 @@ func b(c bytes.Buffer) {
 }
 
 func TestSwig(t *testing.T) {
-	t.Skipf("skipped until golang/go#37098 is resolved")
+	// This is fixed in Go 1.17, but not earlier.
+	testenv.NeedsGo1Point(t, 17)
+
+	if _, err := exec.LookPath("swig"); err != nil {
+		t.Skip("skipping test: swig not available")
+	}
+	if _, err := exec.LookPath("g++"); err != nil {
+		t.Skip("skipping test: g++ not available")
+	}
 
 	const mod = `
 -- go.mod --
@@ -1491,6 +1486,11 @@ package foo_
 	WithOptions(
 		ProxyFiles(proxy),
 		InGOPATH(),
+		EditorConfig{
+			Env: map[string]string{
+				"GO111MODULE": "off",
+			},
+		},
 	).Run(t, contents, func(t *testing.T, env *Env) {
 		// Simulate typing character by character.
 		env.OpenFile("foo/foo_test.go")
@@ -1882,6 +1882,33 @@ package main
 				env.DoneWithSave(),
 				NoLogMatching(protocol.Error, "initial workspace load failed"),
 			),
+		)
+	})
+}
+
+// Tests golang/go#45075, a panic in fillreturns breaks diagnostics.
+func TestFillReturnsPanic(t *testing.T) {
+	// At tip, the panic no longer reproduces.
+	testenv.SkipAfterGo1Point(t, 16)
+	const files = `
+-- go.mod --
+module mod.com
+
+go 1.16
+-- main.go --
+package main
+
+
+func foo() int {
+	return x, nil
+}
+
+`
+	Run(t, files, func(t *testing.T, env *Env) {
+		env.OpenFile("main.go")
+		env.Await(
+			env.DiagnosticAtRegexpWithMessage("main.go", `return x`, "wrong number of return values"),
+			LogMatching(protocol.Error, `.*analysis fillreturns.*panicked.*`, 2),
 		)
 	})
 }
