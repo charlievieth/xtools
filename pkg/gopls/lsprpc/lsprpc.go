@@ -265,7 +265,7 @@ func (f *Forwarder) ServeStream(ctx context.Context, clientConn jsonrpc2.Conn) e
 	)
 	if di := debug.GetInstance(ctx); di != nil {
 		hreq.Logfile = di.Logfile
-		hreq.DebugAddr = di.ListenedDebugAddress
+		hreq.DebugAddr = di.ListenedDebugAddress()
 	}
 	if err := protocol.Call(ctx, serverConn, handshakeMethod, hreq, &hresp); err != nil {
 		// TODO(rfindley): at some point in the future we should return an error
@@ -583,7 +583,7 @@ func handshaker(session *cache.Session, goplsPath string, logHandshakes bool, ha
 			}
 			if di := debug.GetInstance(ctx); di != nil {
 				resp.Logfile = di.Logfile
-				resp.DebugAddr = di.ListenedDebugAddress
+				resp.DebugAddr = di.ListenedDebugAddress()
 			}
 
 			return reply(ctx, resp, nil)
@@ -594,7 +594,7 @@ func handshaker(session *cache.Session, goplsPath string, logHandshakes bool, ha
 			}
 			if di := debug.GetInstance(ctx); di != nil {
 				resp.Logfile = di.Logfile
-				resp.DebugAddr = di.ListenedDebugAddress
+				resp.DebugAddr = di.ListenedDebugAddress()
 				for _, c := range di.State.Clients() {
 					resp.Clients = append(resp.Clients, ClientSession{
 						SessionID: c.Session.ID(),
