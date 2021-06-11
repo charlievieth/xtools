@@ -1,3 +1,5 @@
+// +build gopls_test
+
 // Copyright 2020 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -19,12 +21,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jba/templatecheck"
-	"golang.org/x/tools/go/packages"
 	"github.com/charlievieth/xtools/lsp/cache"
 	"github.com/charlievieth/xtools/lsp/debug"
 	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/span"
+	"github.com/jba/templatecheck"
+	"golang.org/x/tools/go/packages"
 )
 
 type tdata struct {

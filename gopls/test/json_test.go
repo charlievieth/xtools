@@ -1,3 +1,5 @@
+// +build gopls_test
+
 // Copyright 2021 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -11,8 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/charlievieth/xtools/lsp/protocol"
+	"github.com/google/go-cmp/cmp"
 )
 
 // verify that type errors in Initialize lsp messages don't cause

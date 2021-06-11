@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# locate the root directory of the managed-services repo
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+ROOT="$(dirname "$DIR")"
+
+cd "${ROOT}"
+
+while IFS='' read -r -d '' file; do
+	if ! grep -qE '^\s*\/\/\s+\+build\s+.*\bgopls_test\b' "$file"; then
+		# append: '// +build gopls_test' to the start of the file
+		sed -i '1s/^/\/\/ \+build gopls_test\n\n/' "$file"
+		gofmt -w "$file"
+	fi
+done < <(find ./gopls -type f -name '*_test.go' -print0)
+
+
+# TODO: if *_test.go files have build tags we'll need something like this:
+#
+# if head -n10 "$file" | grep -m1 -qE '^\s*\/\/\s+\+build\s+.*'; then
+# 	rep="$(grep -m1 -E '^\s*\/\/\s+\+build\s+.*' "$file" | sed -e 's/[]\/$*.^[]/\\&/g')"
+# 	sed -i "s/${rep}/${rep} gopls_test/g" "$file"
+# fi
