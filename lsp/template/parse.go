@@ -28,6 +28,7 @@ import (
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/span"
+	errors "golang.org/x/xerrors"
 )
 
 var (
@@ -85,6 +86,11 @@ func parseBuffer(buf []byte) *Parsed {
 	ans := &Parsed{
 		buf:   buf,
 		check: -1,
+		nls:   []int{-1},
+	}
+	if len(buf) == 0 {
+		ans.ParseErr = errors.New("empty buffer")
+		return ans
 	}
 	// how to compute allAscii...
 	for _, b := range buf {
@@ -98,7 +104,6 @@ func parseBuffer(buf []byte) *Parsed {
 	}
 	// at the cost of complexity we could fold this into the allAscii loop
 	ans.lines = bytes.Split(buf, []byte{'\n'})
-	ans.nls = []int{-1}
 	for i, p := range ans.buf {
 		if p == '\n' {
 			ans.nls = append(ans.nls, i)

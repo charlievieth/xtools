@@ -45,6 +45,11 @@ type metadata struct {
 
 	// config is the *packages.Config associated with the loaded package.
 	config *packages.Config
+
+	// isIntermediateTestVariant reports whether the given package is an
+	// intermediate test variant, e.g.
+	// "github.com/charlievieth/xtools/lsp/cache [github.com/charlievieth/xtools/lsp/source.test]".
+	isIntermediateTestVariant bool
 }
 
 // load calls packages.Load for the given scopes, updating package metadata,
@@ -55,7 +60,7 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interf
 	for _, scope := range scopes {
 		switch scope := scope.(type) {
 		case packagePath:
-			if isCommandLineArguments(string(scope)) {
+			if source.IsCommandLineArguments(string(scope)) {
 				panic("attempted to load command-line-arguments")
 			}
 			// The only time we pass package paths is when we're doing a
@@ -463,6 +468,7 @@ func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *pa
 			s.workspacePackages[m.id] = m.forTest
 		default:
 			// A test variant of some intermediate package. We don't care about it.
+			m.isIntermediateTestVariant = true
 		}
 	}
 	return m, nil

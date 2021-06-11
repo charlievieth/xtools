@@ -173,14 +173,14 @@ func (s *Session) createView(ctx context.Context, name string, folder, tempWorks
 	}
 	root := folder
 	if options.ExpandWorkspaceToModule {
-		root, err = findWorkspaceRoot(ctx, root, s, pathExcludedByFilterFunc(options), options.ExperimentalWorkspaceModule)
+		root, err = findWorkspaceRoot(ctx, root, s, pathExcludedByFilterFunc(root.Filename(), ws.gomodcache, options), options.ExperimentalWorkspaceModule)
 		if err != nil {
 			return nil, nil, func() {}, err
 		}
 	}
 
 	// Build the gopls workspace, collecting active modules in the view.
-	workspace, err := newWorkspace(ctx, root, s, pathExcludedByFilterFunc(options), ws.userGo111Module == off, options.ExperimentalWorkspaceModule)
+	workspace, err := newWorkspace(ctx, root, s, pathExcludedByFilterFunc(root.Filename(), ws.gomodcache, options), ws.userGo111Module == off, options.ExperimentalWorkspaceModule)
 	if err != nil {
 		return nil, nil, func() {}, err
 	}
@@ -408,6 +408,11 @@ type fileChange struct {
 	content    []byte
 	exists     bool
 	fileHandle source.VersionedFileHandle
+
+	// isUnchanged indicates whether the file action is one that does not
+	// change the actual contents of the file. Opens and closes should not
+	// be treated like other changes, since the file content doesn't change.
+	isUnchanged bool
 }
 
 func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModification) (map[source.Snapshot][]span.URI, []func(), error) {
@@ -448,6 +453,8 @@ func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModif
 		}
 		affectedViews[c.URI] = changedViews
 
+		isUnchanged := c.Action == source.Open || c.Action == source.Close
+
 		// Apply the changes to all affected views.
 		for _, view := range changedViews {
 			// Make sure that the file is added to the view.
@@ -457,9 +464,10 @@ func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModif
 			}
 			if fh, ok := overlays[c.URI]; ok {
 				views[view][c.URI] = &fileChange{
-					content:    fh.text,
-					exists:     true,
-					fileHandle: fh,
+					content:     fh.text,
+					exists:      true,
+					fileHandle:  fh,
+					isUnchanged: isUnchanged,
 				}
 			} else {
 				fsFile, err := s.cache.getFile(ctx, c.URI)
@@ -469,9 +477,10 @@ func (s *Session) DidModifyFiles(ctx context.Context, changes []source.FileModif
 				content, err := fsFile.Read()
 				fh := &closedFile{fsFile}
 				views[view][c.URI] = &fileChange{
-					content:    content,
-					exists:     err == nil,
-					fileHandle: fh,
+					content:     content,
+					exists:      err == nil,
+					fileHandle:  fh,
+					isUnchanged: isUnchanged,
 				}
 			}
 		}
@@ -544,8 +553,7 @@ func knownDirectories(ctx context.Context, snapshots []*snapshot) map[span.URI]s
 		for _, dir := range dirs {
 			result[dir] = struct{}{}
 		}
-		subdirs := snapshot.allKnownSubdirs(ctx)
-		for dir := range subdirs {
+		for _, dir := range snapshot.getKnownSubdirs(dirs) {
 			result[dir] = struct{}{}
 		}
 	}

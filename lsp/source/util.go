@@ -274,20 +274,19 @@ func CompareDiagnostic(a, b *Diagnostic) int {
 	return 1
 }
 
-// FindPosInPackage finds the parsed file for a position in a given search
+// FindPackageFromPos finds the parsed file for a position in a given search
 // package.
-func FindPosInPackage(snapshot Snapshot, searchpkg Package, pos token.Pos) (*ParsedGoFile, Package, error) {
+func FindPackageFromPos(ctx context.Context, snapshot Snapshot, pos token.Pos) (Package, error) {
 	tok := snapshot.FileSet().File(pos)
 	if tok == nil {
-		return nil, nil, errors.Errorf("no file for pos in package %s", searchpkg.ID())
+		return nil, errors.Errorf("no file for pos %v", pos)
 	}
 	uri := span.URIFromPath(tok.Name())
-
-	pgf, pkg, err := findFileInDeps(searchpkg, uri)
+	pkgs, err := snapshot.PackagesForFile(ctx, uri, TypecheckWorkspace)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return pgf, pkg, nil
+	return pkgs[0], nil
 }
 
 // findFileInDeps finds uri in pkg or its dependencies.
@@ -507,4 +506,25 @@ func inDirLex(dir, path string) bool {
 		}
 		return false
 	}
+}
+
+// IsValidImport returns whether importPkgPath is importable
+// by pkgPath
+func IsValidImport(pkgPath, importPkgPath string) bool {
+	i := strings.LastIndex(string(importPkgPath), "/internal/")
+	if i == -1 {
+		return true
+	}
+	if IsCommandLineArguments(string(pkgPath)) {
+		return true
+	}
+	return strings.HasPrefix(string(pkgPath), string(importPkgPath[:i]))
+}
+
+// IsCommandLineArguments reports whether a given value denotes
+// "command-line-arguments" package, which is a package with an unknown ID
+// created by the go command. It can have a test variant, which is why callers
+// should not check that a value equals "command-line-arguments" directly.
+func IsCommandLineArguments(s string) bool {
+	return strings.Contains(s, "command-line-arguments")
 }

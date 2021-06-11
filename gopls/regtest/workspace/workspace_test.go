@@ -305,6 +305,8 @@ func main() {
 // This change tests that the version of the module used changes after it has
 // been deleted from the workspace.
 func TestDeleteModule_Interdependent(t *testing.T) {
+	t.Skip("Skipping due to golang/go#46375: race due to orphaned file reloading")
+
 	const multiModule = `
 -- moda/a/go.mod --
 module a.com
@@ -908,6 +910,44 @@ func main() {
 		}
 		env.Await(
 			EmptyDiagnostics("b/go.mod"),
+		)
+	})
+}
+
+// Sometimes users may have their module cache within the workspace.
+// We shouldn't consider any module in the module cache to be in the workspace.
+func TestGOMODCACHEInWorkspace(t *testing.T) {
+	const mod = `
+-- a/go.mod --
+module a.com
+
+go 1.12
+-- a/a.go --
+package a
+
+func _() {}
+-- a/c/c.go --
+package c
+-- gopath/src/b/b.go --
+package b
+-- gopath/pkg/mod/example.com/go.mod --
+module example.com
+
+go 1.12
+-- gopath/pkg/mod/example.com/main.go --
+package main
+`
+	WithOptions(
+		EditorConfig{Env: map[string]string{
+			"GOPATH": filepath.FromSlash("$SANDBOX_WORKDIR/gopath"),
+		}},
+		Modes(Singleton),
+	).Run(t, mod, func(t *testing.T, env *Env) {
+		env.Await(
+			// Confirm that the build configuration is seen as valid,
+			// even though there are technically multiple go.mod files in the
+			// worskpace.
+			LogMatching(protocol.Info, ".*valid build configuration = true.*", 1, false),
 		)
 	})
 }

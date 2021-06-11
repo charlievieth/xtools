@@ -7,7 +7,10 @@ package jsonrpc2
 import (
 	"context"
 	"io"
+	"runtime"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	errors "golang.org/x/xerrors"
@@ -133,13 +136,18 @@ func isClosingError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// fully unwrap the error, so the following tests work
+	// Fully unwrap the error, so the following tests work.
 	for wrapped := err; wrapped != nil; wrapped = errors.Unwrap(err) {
 		err = wrapped
 	}
 
-	// was it based on an EOF error?
+	// Was it based on an EOF error?
 	if err == io.EOF {
+		return true
+	}
+
+	// Was it based on a closed pipe?
+	if err == io.ErrClosedPipe {
 		return true
 	}
 
@@ -150,6 +158,16 @@ func isClosingError(err error) bool {
 		return true
 	}
 
+	if runtime.GOOS == "plan9" {
+		// Error reading from a closed connection.
+		if err == syscall.EINVAL {
+			return true
+		}
+		// Error trying to accept a new connection from a closed listener.
+		if strings.HasSuffix(err.Error(), " listen hungup") {
+			return true
+		}
+	}
 	return false
 }
 

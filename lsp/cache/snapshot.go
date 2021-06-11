@@ -111,6 +111,14 @@ type snapshot struct {
 
 	workspace          *workspace
 	workspaceDirHandle *memoize.Handle
+
+	// knownSubdirs is the set of subdirectories in the workspace, used to
+	// create glob patterns for file watching.
+	knownSubdirs map[span.URI]struct{}
+	// unprocessedSubdirChanges are any changes that might affect the set of
+	// subdirectories in the workspace. They are not reflected to knownSubdirs
+	// during the snapshot cloning step as it can slow down cloning.
+	unprocessedSubdirChanges []*fileChange
 }
 
 type packageKey struct {
@@ -525,6 +533,11 @@ func (s *snapshot) packageHandlesForFile(ctx context.Context, uri span.URI, mode
 	// Get the list of IDs from the snapshot again, in case it has changed.
 	var phs []*packageHandle
 	for _, id := range s.getIDsForURI(uri) {
+		// Filter out any intermediate test variants. We typically aren't
+		// interested in these packages for file= style queries.
+		if m := s.getMetadata(id); m != nil && m.isIntermediateTestVariant {
+			continue
+		}
 		var parseModes []source.ParseMode
 		switch mode {
 		case source.TypecheckAll:
@@ -712,7 +725,7 @@ func (s *snapshot) fileWatchingGlobPatterns(ctx context.Context) map[string]stru
 	// of the directories in the workspace. We find them by adding the
 	// directories of every file in the snapshot's workspace directories.
 	var dirNames []string
-	for uri := range s.allKnownSubdirs(ctx) {
+	for _, uri := range s.getKnownSubdirs(dirs) {
 		dirNames = append(dirNames, uri.Filename())
 	}
 	sort.Strings(dirNames)
@@ -722,40 +735,89 @@ func (s *snapshot) fileWatchingGlobPatterns(ctx context.Context) map[string]stru
 	return patterns
 }
 
-// allKnownSubdirs returns all of the subdirectories within the snapshot's
-// workspace directories. None of the workspace directories are included.
-func (s *snapshot) allKnownSubdirs(ctx context.Context) map[span.URI]struct{} {
+// collectAllKnownSubdirs collects all of the subdirectories within the
+// snapshot's workspace directories. None of the workspace directories are
+// included.
+func (s *snapshot) collectAllKnownSubdirs(ctx context.Context) {
 	dirs := s.workspace.dirs(ctx, s)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	seen := make(map[span.URI]struct{})
+
+	s.knownSubdirs = map[span.URI]struct{}{}
 	for uri := range s.files {
-		dir := filepath.Dir(uri.Filename())
-		var matched span.URI
-		for _, wsDir := range dirs {
-			if source.InDir(wsDir.Filename(), dir) {
-				matched = wsDir
-				break
-			}
-		}
-		// Don't watch any directory outside of the workspace directories.
-		if matched == "" {
+		s.addKnownSubdirLocked(uri, dirs)
+	}
+}
+
+func (s *snapshot) getKnownSubdirs(wsDirs []span.URI) []span.URI {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// First, process any pending changes and update the set of known
+	// subdirectories.
+	for _, c := range s.unprocessedSubdirChanges {
+		if c.isUnchanged {
 			continue
 		}
-		for {
-			if dir == "" || dir == matched.Filename() {
-				break
-			}
-			uri := span.URIFromPath(dir)
-			if _, ok := seen[uri]; ok {
-				break
-			}
-			seen[uri] = struct{}{}
-			dir = filepath.Dir(dir)
+		if !c.exists {
+			s.removeKnownSubdirLocked(c.fileHandle.URI())
+		} else {
+			s.addKnownSubdirLocked(c.fileHandle.URI(), wsDirs)
 		}
 	}
-	return seen
+	s.unprocessedSubdirChanges = nil
+
+	var result []span.URI
+	for uri := range s.knownSubdirs {
+		result = append(result, uri)
+	}
+	return result
+}
+
+func (s *snapshot) addKnownSubdirLocked(uri span.URI, dirs []span.URI) {
+	dir := filepath.Dir(uri.Filename())
+	// First check if the directory is already known, because then we can
+	// return early.
+	if _, ok := s.knownSubdirs[span.URIFromPath(dir)]; ok {
+		return
+	}
+	var matched span.URI
+	for _, wsDir := range dirs {
+		if source.InDir(wsDir.Filename(), dir) {
+			matched = wsDir
+			break
+		}
+	}
+	// Don't watch any directory outside of the workspace directories.
+	if matched == "" {
+		return
+	}
+	for {
+		if dir == "" || dir == matched.Filename() {
+			break
+		}
+		uri := span.URIFromPath(dir)
+		if _, ok := s.knownSubdirs[uri]; ok {
+			break
+		}
+		s.knownSubdirs[uri] = struct{}{}
+		dir = filepath.Dir(dir)
+	}
+}
+
+func (s *snapshot) removeKnownSubdirLocked(uri span.URI) {
+	dir := filepath.Dir(uri.Filename())
+	for dir != "" {
+		uri := span.URIFromPath(dir)
+		if _, ok := s.knownSubdirs[uri]; !ok {
+			break
+		}
+		if info, _ := os.Stat(dir); info == nil {
+			delete(s.knownSubdirs, uri)
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 // knownFilesInDir returns the files known to the given snapshot that are in
@@ -957,9 +1019,9 @@ func (s *snapshot) addID(uri span.URI, id packageID) {
 		if existingID == id {
 			return
 		}
-		// If we are setting a real ID, when the package had only previously
-		// had a command-line-arguments ID, we should just replace it.
-		if isCommandLineArguments(string(existingID)) {
+		// If the package previously only had a command-line-arguments ID,
+		// we should just replace it.
+		if source.IsCommandLineArguments(string(existingID)) {
 			s.ids[uri][i] = id
 			// Delete command-line-arguments if it was a workspace package.
 			delete(s.workspacePackages, existingID)
@@ -967,14 +1029,6 @@ func (s *snapshot) addID(uri span.URI, id packageID) {
 		}
 	}
 	s.ids[uri] = append(s.ids[uri], id)
-}
-
-// isCommandLineArguments reports whether a given value denotes
-// "command-line-arguments" package, which is a package with an unknown ID
-// created by the go command. It can have a test variant, which is why callers
-// should not check that a value equals "command-line-arguments" directly.
-func isCommandLineArguments(s string) bool {
-	return strings.Contains(s, "command-line-arguments")
 }
 
 func (s *snapshot) isWorkspacePackage(id packageID) bool {
@@ -1114,7 +1168,7 @@ func shouldShowAdHocPackagesWarning(snapshot source.Snapshot, pkgs []source.Pack
 
 func containsCommandLineArguments(pkgs []source.Package) bool {
 	for _, pkg := range pkgs {
-		if isCommandLineArguments(pkg.ID()) {
+		if source.IsCommandLineArguments(pkg.ID()) {
 			return true
 		}
 	}
@@ -1180,7 +1234,7 @@ func (s *snapshot) reloadWorkspace(ctx context.Context) error {
 		missingMetadata = true
 
 		// Don't try to reload "command-line-arguments" directly.
-		if isCommandLineArguments(string(pkgPath)) {
+		if source.IsCommandLineArguments(string(pkgPath)) {
 			continue
 		}
 		pkgPathSet[pkgPath] = struct{}{}
@@ -1367,6 +1421,7 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]*fileC
 		parseModHandles:   make(map[span.URI]*parseModHandle, len(s.parseModHandles)),
 		modTidyHandles:    make(map[span.URI]*modTidyHandle, len(s.modTidyHandles)),
 		modWhyHandles:     make(map[span.URI]*modWhyHandle, len(s.modWhyHandles)),
+		knownSubdirs:      make(map[span.URI]struct{}, len(s.knownSubdirs)),
 		workspace:         newWorkspace,
 	}
 
@@ -1394,7 +1449,6 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]*fileC
 			continue
 		}
 		newGen.Inherit(v.handle)
-		newGen.Inherit(v.astCacheHandle)
 		result.goFiles[k] = v
 	}
 
@@ -1413,6 +1467,16 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]*fileC
 		result.modWhyHandles[k] = v
 	}
 
+	// Add all of the known subdirectories, but don't update them for the
+	// changed files. We need to rebuild the workspace module to know the
+	// true set of known subdirectories, but we don't want to do that in clone.
+	for k, v := range s.knownSubdirs {
+		result.knownSubdirs[k] = v
+	}
+	for _, c := range changes {
+		result.unprocessedSubdirChanges = append(result.unprocessedSubdirChanges, c)
+	}
+
 	// directIDs keeps track of package IDs that have directly changed.
 	// It maps id->invalidateMetadata.
 	directIDs := map[packageID]bool{}
@@ -1424,6 +1488,7 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]*fileC
 	}
 
 	changedPkgNames := map[packageID]struct{}{}
+	anyImportDeleted := false
 	for uri, change := range changes {
 		// Maybe reinitialize the view if we see a change in the vendor
 		// directory.
@@ -1436,7 +1501,8 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]*fileC
 
 		// Check if the file's package name or imports have changed,
 		// and if so, invalidate this file's packages' metadata.
-		shouldInvalidateMetadata, pkgNameChanged := s.shouldInvalidateMetadata(ctx, result, originalFH, change.fileHandle)
+		shouldInvalidateMetadata, pkgNameChanged, importDeleted := s.shouldInvalidateMetadata(ctx, result, originalFH, change.fileHandle)
+		anyImportDeleted = anyImportDeleted || importDeleted
 		invalidateMetadata := forceReloadMetadata || workspaceReload || shouldInvalidateMetadata
 
 		// Mark all of the package IDs containing the given file.
@@ -1475,6 +1541,27 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]*fileC
 
 		// Make sure to remove the changed file from the unloadable set.
 		delete(result.unloadableFiles, uri)
+	}
+
+	// Deleting an import can cause list errors due to import cycles to be
+	// resolved. The best we can do without parsing the list error message is to
+	// hope that list errors may have been resolved by a deleted import.
+	//
+	// We could do better by parsing the list error message. We already do this
+	// to assign a better range to the list error, but for such critical
+	// functionality as metadata, it's better to be conservative until it proves
+	// impractical.
+	//
+	// We could also do better by looking at which imports were deleted and
+	// trying to find cycles they are involved in. This fails when the file goes
+	// from an unparseable state to a parseable state, as we don't have a
+	// starting point to compare with.
+	if anyImportDeleted {
+		for id, metadata := range s.metadata {
+			if len(metadata.errors) > 0 {
+				directIDs[id] = true
+			}
+		}
 	}
 
 	// Invalidate reverse dependencies too.
@@ -1546,7 +1633,7 @@ func (s *snapshot) clone(ctx, bgCtx context.Context, changes map[span.URI]*fileC
 		// go command when the user is outside of GOPATH and outside of a
 		// module. Do not cache them as workspace packages for longer than
 		// necessary.
-		if isCommandLineArguments(string(id)) {
+		if source.IsCommandLineArguments(string(id)) {
 			if invalidateMetadata, ok := transitiveIDs[id]; invalidateMetadata && ok {
 				continue
 			}
@@ -1681,13 +1768,13 @@ func fileWasSaved(originalFH, currentFH source.FileHandle) bool {
 
 // shouldInvalidateMetadata reparses a file's package and import declarations to
 // determine if the file requires a metadata reload.
-func (s *snapshot) shouldInvalidateMetadata(ctx context.Context, newSnapshot *snapshot, originalFH, currentFH source.FileHandle) (invalidate, pkgNameChanged bool) {
+func (s *snapshot) shouldInvalidateMetadata(ctx context.Context, newSnapshot *snapshot, originalFH, currentFH source.FileHandle) (invalidate, pkgNameChanged, importDeleted bool) {
 	if originalFH == nil {
-		return true, false
+		return true, false, false
 	}
 	// If the file hasn't changed, there's no need to reload.
 	if originalFH.FileIdentity() == currentFH.FileIdentity() {
-		return false, false
+		return false, false, false
 	}
 	// Get the original and current parsed files in order to check package name
 	// and imports. Use the new snapshot to parse to avoid modifying the
@@ -1695,53 +1782,77 @@ func (s *snapshot) shouldInvalidateMetadata(ctx context.Context, newSnapshot *sn
 	original, originalErr := newSnapshot.ParseGo(ctx, originalFH, source.ParseHeader)
 	current, currentErr := newSnapshot.ParseGo(ctx, currentFH, source.ParseHeader)
 	if originalErr != nil || currentErr != nil {
-		return (originalErr == nil) != (currentErr == nil), false
+		return (originalErr == nil) != (currentErr == nil), false, (currentErr != nil) // we don't know if an import was deleted
 	}
 	// Check if the package's metadata has changed. The cases handled are:
 	//    1. A package's name has changed
 	//    2. A file's imports have changed
 	if original.File.Name.Name != current.File.Name.Name {
-		return true, true
+		invalidate = true
+		pkgNameChanged = true
 	}
-	importSet := make(map[string]struct{})
+	origImportSet := make(map[string]struct{})
 	for _, importSpec := range original.File.Imports {
-		importSet[importSpec.Path.Value] = struct{}{}
+		origImportSet[importSpec.Path.Value] = struct{}{}
+	}
+	curImportSet := make(map[string]struct{})
+	for _, importSpec := range current.File.Imports {
+		curImportSet[importSpec.Path.Value] = struct{}{}
 	}
 	// If any of the current imports were not in the original imports.
-	for _, importSpec := range current.File.Imports {
-		if _, ok := importSet[importSpec.Path.Value]; ok {
+	for path := range curImportSet {
+		if _, ok := origImportSet[path]; ok {
+			delete(origImportSet, path)
 			continue
 		}
 		// If the import path is obviously not valid, we can skip reloading
 		// metadata. For now, valid means properly quoted and without a
 		// terminal slash.
-		path, err := strconv.Unquote(importSpec.Path.Value)
-		if err != nil {
+		if isBadImportPath(path) {
 			continue
 		}
-		if path == "" {
-			continue
-		}
-		if path[len(path)-1] == '/' {
-			continue
-		}
-		return true, false
+		invalidate = true
 	}
 
-	// Re-evaluate build constraints and embed patterns. It would be preferable
-	// to only do this on save, but we don't have the prior versions accessible.
-	oldComments := extractMagicComments(original.File)
-	newComments := extractMagicComments(current.File)
+	for path := range origImportSet {
+		if !isBadImportPath(path) {
+			invalidate = true
+			importDeleted = true
+		}
+	}
+
+	if !invalidate {
+		invalidate = magicCommentsChanged(original.File, current.File)
+	}
+	return invalidate, pkgNameChanged, importDeleted
+}
+
+func magicCommentsChanged(original *ast.File, current *ast.File) bool {
+	oldComments := extractMagicComments(original)
+	newComments := extractMagicComments(current)
 	if len(oldComments) != len(newComments) {
-		return true, false
+		return true
 	}
 	for i := range oldComments {
 		if oldComments[i] != newComments[i] {
-			return true, false
+			return true
 		}
 	}
+	return false
+}
 
-	return false, false
+func isBadImportPath(path string) bool {
+	path, err := strconv.Unquote(path)
+	if err != nil {
+		return true
+	}
+	if path == "" {
+		return true
+	}
+	if path[len(path)-1] == '/' {
+		return true
+	}
+	return false
 }
 
 var buildConstraintOrEmbedRe = regexp.MustCompile(`^//(go:embed|go:build|\s*\+build).*`)
@@ -1794,8 +1905,8 @@ func (s *snapshot) setBuiltin(path string) {
 
 // BuildGoplsMod generates a go.mod file for all modules in the workspace. It
 // bypasses any existing gopls.mod.
-func BuildGoplsMod(ctx context.Context, root span.URI, s source.Snapshot) (*modfile.File, error) {
-	allModules, err := findModules(root, pathExcludedByFilterFunc(s.View().Options()), 0)
+func (s *snapshot) BuildGoplsMod(ctx context.Context) (*modfile.File, error) {
+	allModules, err := findModules(s.view.folder, pathExcludedByFilterFunc(s.view.rootURI.Filename(), s.view.gomodcache, s.View().Options()), 0)
 	if err != nil {
 		return nil, err
 	}

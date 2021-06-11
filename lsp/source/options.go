@@ -710,8 +710,12 @@ func (o *Options) Clone() *Options {
 	return result
 }
 
-func (o *Options) AddStaticcheckAnalyzer(a *analysis.Analyzer, enabled bool) {
-	o.StaticcheckAnalyzers[a.Name] = &Analyzer{Analyzer: a, Enabled: enabled}
+func (o *Options) AddStaticcheckAnalyzer(a *analysis.Analyzer, enabled bool, severity protocol.DiagnosticSeverity) {
+	o.StaticcheckAnalyzers[a.Name] = &Analyzer{
+		Analyzer: a,
+		Enabled:  enabled,
+		Severity: severity,
+	}
 }
 
 // enableAllExperiments turns on all of the experimental "off-by-default"
@@ -1263,10 +1267,11 @@ type EnumValue struct {
 }
 
 type CommandJSON struct {
-	Command string
-	Title   string
-	Doc     string
-	ArgDoc  string
+	Command   string
+	Title     string
+	Doc       string
+	ArgDoc    string
+	ResultDoc string
 }
 
 type LensJSON struct {

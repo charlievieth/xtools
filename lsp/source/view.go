@@ -80,12 +80,12 @@ type Snapshot interface {
 	// to quickly find corresponding *ast.Field node given a *types.Var.
 	// We must refer to the AST to render type aliases properly when
 	// formatting signatures and other types.
-	PosToField(ctx context.Context, pgf *ParsedGoFile) (map[token.Pos]*ast.Field, error)
+	PosToField(ctx context.Context, pkg Package, pos token.Pos) (*ast.Field, error)
 
 	// PosToDecl maps certain objects' positions to their surrounding
 	// ast.Decl. This mapping is used when building the documentation
 	// string for the objects.
-	PosToDecl(ctx context.Context, pgf *ParsedGoFile) (map[token.Pos]ast.Decl, error)
+	PosToDecl(ctx context.Context, pkg Package, pos token.Pos) (ast.Decl, error)
 
 	// DiagnosePackage returns basic diagnostics, including list, parse, and type errors
 	// for pkg, grouped by file.
@@ -160,6 +160,10 @@ type Snapshot interface {
 
 	// GetCriticalError returns any critical errors in the workspace.
 	GetCriticalError(ctx context.Context) *CriticalError
+
+	// BuildGoplsMod generates a go.mod file for all modules in the workspace.
+	// It bypasses any existing gopls.mod.
+	BuildGoplsMod(ctx context.Context) (*modfile.File, error)
 }
 
 // PackageFilter sets how a package is filtered out from a set of packages
@@ -419,10 +423,9 @@ const (
 	// This is the mode used when attempting to examine the package graph structure.
 	ParseHeader ParseMode = iota
 
-	// ParseExported specifies that the public symbols are needed, but things like
-	// private symbols and function bodies are not.
-	// This mode is used for things where a package is being consumed only as a
-	// dependency.
+	// ParseExported specifies that the package is used only as a dependency,
+	// and only its exported declarations are needed. More may be included if
+	// necessary to avoid type errors.
 	ParseExported
 
 	// ParseFull specifies the full AST is needed.
@@ -535,6 +538,10 @@ type Analyzer struct {
 	// ActionKind is the kind of code action this analyzer produces. If
 	// unspecified the type defaults to quickfix.
 	ActionKind []protocol.CodeActionKind
+
+	// Severity is the severity set for diagnostics reported by this
+	// analyzer. If left unset it defaults to Warning.
+	Severity protocol.DiagnosticSeverity
 }
 
 func (a Analyzer) IsEnabled(view View) bool {

@@ -438,7 +438,7 @@ func TestResolveDiagnosticWithDownload(t *testing.T) {
 func TestMissingDependency(t *testing.T) {
 	Run(t, testPackageWithRequire, func(t *testing.T, env *Env) {
 		env.OpenFile("print.go")
-		env.Await(LogMatching(protocol.Error, "initial workspace load failed", 1))
+		env.Await(LogMatching(protocol.Error, "initial workspace load failed", 1, false))
 	})
 }
 
@@ -1569,6 +1569,7 @@ func main() {
 		env.Await(
 			env.DiagnosticAtRegexp("main.go", `"mod.com/bob"`),
 			EmptyDiagnostics("bob/bob.go"),
+			RegistrationMatching("didChangeWatchedFiles"),
 		)
 	})
 }
@@ -1611,6 +1612,42 @@ import _ "mod.com/triple/a"
 			env.DiagnosticAtRegexpWithMessage("self/self.go", `_ "mod.com/self"`, "import cycle not allowed"),
 			env.DiagnosticAtRegexpWithMessage("double/a/a.go", `_ "mod.com/double/b"`, "import cycle not allowed"),
 			env.DiagnosticAtRegexpWithMessage("triple/a/a.go", `_ "mod.com/triple/b"`, "import cycle not allowed"),
+		)
+	})
+}
+
+// Tests golang/go#46667: deleting a problematic import path should resolve
+// import cycle errors.
+func TestResolveImportCycle(t *testing.T) {
+	const mod = `
+-- go.mod --
+module mod.test
+
+go 1.16
+-- a/a.go --
+package a
+
+import "mod.test/b"
+
+const A = b.A
+const B = 2
+-- b/b.go --
+package b
+
+import "mod.test/a"
+
+const A = 1
+const B = a.B
+	`
+	Run(t, mod, func(t *testing.T, env *Env) {
+		env.OpenFile("a/a.go")
+		env.OpenFile("b/b.go")
+		env.Await(env.DiagnosticAtRegexp("a/a.go", `"mod.test/b"`))
+		env.RegexpReplace("b/b.go", `const B = a\.B`, "")
+		env.SaveBuffer("b/b.go")
+		env.Await(
+			EmptyDiagnostics("a/a.go"),
+			EmptyDiagnostics("b/b.go"),
 		)
 	})
 }
@@ -1886,29 +1923,57 @@ package main
 	})
 }
 
-// Tests golang/go#45075, a panic in fillreturns breaks diagnostics.
+// Tests golang/go#45075: A panic in fillreturns broke diagnostics.
+// Expect an error log indicating that fillreturns panicked, as well type
+// errors for the broken code.
 func TestFillReturnsPanic(t *testing.T) {
 	// At tip, the panic no longer reproduces.
 	testenv.SkipAfterGo1Point(t, 16)
+
 	const files = `
 -- go.mod --
 module mod.com
 
-go 1.16
+go 1.15
 -- main.go --
 package main
-
 
 func foo() int {
 	return x, nil
 }
-
 `
 	Run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("main.go")
 		env.Await(
-			env.DiagnosticAtRegexpWithMessage("main.go", `return x`, "wrong number of return values"),
-			LogMatching(protocol.Error, `.*analysis fillreturns.*panicked.*`, 2),
+			OnceMet(
+				env.DoneWithOpen(),
+				LogMatching(protocol.Error, `.*analysis fillreturns.*panicked.*`, 1, true),
+				env.DiagnosticAtRegexpWithMessage("main.go", `return x`, "wrong number of return values"),
+			),
+		)
+	})
+}
+
+// This test confirms that the view does not reinitialize when a go.mod file is
+// opened.
+func TestNoReinitialize(t *testing.T) {
+	const files = `
+-- go.mod --
+module mod.com
+
+go 1.12
+-- main.go --
+package main
+
+func main() {}
+`
+	Run(t, files, func(t *testing.T, env *Env) {
+		env.OpenFile("go.mod")
+		env.Await(
+			OnceMet(
+				env.DoneWithOpen(),
+				LogMatching(protocol.Info, `.*query=\[builtin mod.com/...\].*`, 1, false),
+			),
 		)
 	})
 }

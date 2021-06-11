@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/charlievieth/xtools/lsp/cache"
+	"github.com/charlievieth/xtools/lsp/command"
 	"github.com/charlievieth/xtools/lsp/diff"
 	"github.com/charlievieth/xtools/lsp/diff/myers"
 	"github.com/charlievieth/xtools/lsp/protocol"
@@ -101,9 +102,17 @@ type testClient struct {
 	runner *runner
 }
 
+func (c testClient) Close() error {
+	return nil
+}
+
 // Trivially implement PublishDiagnostics so that we can call
 // server.publishReports below to de-dup sent diagnostics.
 func (c testClient) PublishDiagnostics(context.Context, *protocol.PublishDiagnosticsParams) error {
+	return nil
+}
+
+func (c testClient) ShowMessage(context.Context, *protocol.ShowMessageParams) error {
 	return nil
 }
 
@@ -1091,6 +1100,57 @@ func (r *runner) Link(t *testing.T, uri span.URI, wantLinks []tests.Link) {
 	}
 	if diff := tests.DiffLinks(m, wantLinks, got); diff != "" {
 		t.Error(diff)
+	}
+}
+
+func (r *runner) AddImport(t *testing.T, uri span.URI, expectedImport string) {
+	cmd, err := command.NewListKnownPackagesCommand("List Known Packages", command.URIArg{
+		URI: protocol.URIFromSpanURI(uri),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := r.server.executeCommand(r.ctx, &protocol.ExecuteCommandParams{
+		Command:   cmd.Command,
+		Arguments: cmd.Arguments,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := resp.(command.ListKnownPackagesResult)
+	var hasPkg bool
+	for _, p := range res.Packages {
+		if p == expectedImport {
+			hasPkg = true
+			break
+		}
+	}
+	if !hasPkg {
+		t.Fatalf("%s: got %v packages\nwant contains %q", command.ListKnownPackages, res.Packages, expectedImport)
+	}
+	cmd, err = command.NewAddImportCommand("Add Imports", command.AddImportArgs{
+		URI:        protocol.URIFromSpanURI(uri),
+		ImportPath: expectedImport,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.server.executeCommand(r.ctx, &protocol.ExecuteCommandParams{
+		Command:   cmd.Command,
+		Arguments: cmd.Arguments,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := (<-r.editRecv)[uri]
+	want := r.data.Golden("addimport", uri.Filename(), func() ([]byte, error) {
+		return []byte(got), nil
+	})
+	if want == nil {
+		t.Fatalf("golden file %q not found", uri.Filename())
+	}
+	if diff := tests.Diff(t, got, string(want)); diff != "" {
+		t.Errorf("%s mismatch\n%s", command.AddImport, diff)
 	}
 }
 

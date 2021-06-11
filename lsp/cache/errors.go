@@ -34,7 +34,7 @@ func goPackagesErrorDiagnostics(snapshot *snapshot, pkg *pkg, e packages.Error) 
 			URI:      spn.URI(),
 			Range:    rng,
 			Severity: protocol.SeverityError,
-			Source:   source.TypeError,
+			Source:   source.ListError,
 			Message:  msg,
 		}}, nil
 	}
@@ -208,10 +208,15 @@ func analysisDiagnosticDiagnostics(snapshot *snapshot, pkg *pkg, a *analysis.Ana
 	if err != nil {
 		return nil, err
 	}
+
+	severity := srcAnalyzer.Severity
+	if severity == 0 {
+		severity = protocol.SeverityWarning
+	}
 	diag := &source.Diagnostic{
 		URI:            spn.URI(),
 		Range:          rng,
-		Severity:       protocol.SeverityWarning,
+		Severity:       severity,
 		Source:         source.AnalyzerErrorKind(e.Category),
 		Message:        e.Message,
 		Related:        related,
