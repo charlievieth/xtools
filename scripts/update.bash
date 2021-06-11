@@ -105,6 +105,12 @@ for file in ./gopls/internal/*; do
 done
 rm -r ./gopls/internal
 
+# disable gopls tests
+while IFS='' read -r -d '' file; do
+	sed -i '1s/^/\/\/ \+build gopls_test\n\n/' "$file"
+	gofmt -w "$file"
+done < <(find ./gopls -type f -name '*_test.go' -print0)
+
 git add ./gopls
 
 # pull the latest tools since gopls depends on them
