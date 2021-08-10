@@ -9,6 +9,8 @@ package bench
 import (
 	"flag"
 	"fmt"
+	"os"
+	"runtime/pprof"
 	"testing"
 	"time"
 
@@ -91,7 +93,7 @@ func TestBenchmarkSymbols(t *testing.T) {
 		t.Skip("-symbol_workdir not configured")
 	}
 
-	opts := stressTestOptions(symbolOptions.workdir)
+	opts := benchmarkOptions(symbolOptions.workdir)
 	conf := EditorConfig{}
 	if symbolOptions.matcher != "" {
 		conf.SymbolMatcher = &symbolOptions.matcher
@@ -133,8 +135,9 @@ func TestBenchmarkSymbols(t *testing.T) {
 }
 
 var (
-	benchDir  = flag.String("didchange_dir", "", "If set, run benchmarks in this dir. Must also set regtest_bench_file.")
-	benchFile = flag.String("didchange_file", "", "The file to modify")
+	benchDir     = flag.String("didchange_dir", "", "If set, run benchmarks in this dir. Must also set regtest_bench_file.")
+	benchFile    = flag.String("didchange_file", "", "The file to modify")
+	benchProfile = flag.String("didchange_cpuprof", "", "file to write cpu profiling data to")
 )
 
 // TestBenchmarkDidChange benchmarks modifications of a single file by making
@@ -164,6 +167,17 @@ func TestBenchmarkDidChange(t *testing.T) {
 		// Insert the text we'll be modifying at the top of the file.
 		env.EditBuffer(*benchFile, fake.Edit{Text: "// __REGTEST_PLACEHOLDER_0__\n"})
 		result := testing.Benchmark(func(b *testing.B) {
+			if *benchProfile != "" {
+				profile, err := os.Create(*benchProfile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer profile.Close()
+				if err := pprof.StartCPUProfile(profile); err != nil {
+					t.Fatal(err)
+				}
+				defer pprof.StopCPUProfile()
+			}
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				env.EditBuffer(*benchFile, fake.Edit{

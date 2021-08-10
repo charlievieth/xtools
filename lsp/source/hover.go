@@ -19,6 +19,7 @@ import (
 
 	"github.com/charlievieth/xtools/event"
 	"github.com/charlievieth/xtools/lsp/protocol"
+	"github.com/charlievieth/xtools/typeparams"
 	errors "golang.org/x/xerrors"
 )
 
@@ -97,7 +98,7 @@ func HoverIdentifier(ctx context.Context, i *IdentifierInfo) (*HoverInformation,
 	defer done()
 
 	fset := i.Snapshot.FileSet()
-	h, err := HoverInfo(ctx, i.Snapshot, i.pkg, i.Declaration.obj, i.Declaration.node, i.Declaration.fullSpec)
+	h, err := HoverInfo(ctx, i.Snapshot, i.pkg, i.Declaration.obj, i.Declaration.node, i.Declaration.fullDecl)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +117,16 @@ func HoverIdentifier(ctx context.Context, i *IdentifierInfo) (*HoverInformation,
 			}
 			h.Signature = prefix + h.Signature
 		}
+
+		// Check if the variable is an integer whose value we can present in a more
+		// user-friendly way, i.e. `var hex = 0xe34e` becomes `var hex = 58190`
+		if spec, ok := x.(*ast.ValueSpec); ok && len(spec.Values) > 0 {
+			if lit, ok := spec.Values[0].(*ast.BasicLit); ok && len(spec.Names) > 0 {
+				val := constant.MakeFromLiteral(types.ExprString(lit), lit.Kind, 0)
+				h.Signature = fmt.Sprintf("var %s = %s", spec.Names[0], val)
+			}
+		}
+
 	case types.Object:
 		// If the variable is implicitly declared in a type switch, we need to
 		// manually generate its object string.
@@ -125,10 +136,10 @@ func HoverIdentifier(ctx context.Context, i *IdentifierInfo) (*HoverInformation,
 				break
 			}
 		}
-		h.Signature = objectString(x, i.qf)
+		h.Signature = objectString(x, i.qf, i.Inferred)
 	}
 	if obj := i.Declaration.obj; obj != nil {
-		h.SingleLine = objectString(obj, i.qf)
+		h.SingleLine = objectString(obj, i.qf, nil)
 	}
 	obj := i.Declaration.obj
 	if obj == nil {
@@ -237,7 +248,21 @@ func moduleAtVersion(path string, i *IdentifierInfo) (string, string, bool) {
 
 // objectString is a wrapper around the types.ObjectString function.
 // It handles adding more information to the object string.
-func objectString(obj types.Object, qf types.Qualifier) string {
+func objectString(obj types.Object, qf types.Qualifier, inferred *types.Signature) string {
+	// If the signature type was inferred, prefer the preferred signature with a
+	// comment showing the generic signature.
+	if sig, _ := obj.Type().(*types.Signature); sig != nil && len(typeparams.ForSignature(sig)) > 0 && inferred != nil {
+		obj2 := types.NewFunc(obj.Pos(), obj.Pkg(), obj.Name(), inferred)
+		str := types.ObjectString(obj2, qf)
+		// Try to avoid overly long lines.
+		if len(str) > 60 {
+			str += "\n"
+		} else {
+			str += " "
+		}
+		str += "// " + types.TypeString(sig, qf)
+		return str
+	}
 	str := types.ObjectString(obj, qf)
 	switch obj := obj.(type) {
 	case *types.Const:
@@ -259,15 +284,28 @@ func objectString(obj types.Object, qf types.Qualifier) string {
 }
 
 // HoverInfo returns a HoverInformation struct for an ast node and its type
-// object.
-func HoverInfo(ctx context.Context, s Snapshot, pkg Package, obj types.Object, node ast.Node, spec ast.Spec) (*HoverInformation, error) {
+// object. node should be the actual node used in type checking, while fullNode
+// could be a separate node with more complete syntactic information.
+func HoverInfo(ctx context.Context, s Snapshot, pkg Package, obj types.Object, pkgNode ast.Node, fullDecl ast.Decl) (*HoverInformation, error) {
 	var info *HoverInformation
+
+	// This is problematic for a number of reasons. We really need to have a more
+	// general mechanism to validate the coherency of AST with type information,
+	// but absent that we must do our best to ensure that we don't use fullNode
+	// when we actually need the node that was type checked.
+	//
+	// pkgNode may be nil, if it was eliminated from the type-checked syntax. In
+	// that case, use fullDecl if available.
+	node := pkgNode
+	if node == nil && fullDecl != nil {
+		node = fullDecl
+	}
 
 	switch node := node.(type) {
 	case *ast.Ident:
 		// The package declaration.
 		for _, f := range pkg.GetSyntax() {
-			if f.Name == node {
+			if f.Name == pkgNode {
 				info = &HoverInformation{comment: f.Doc}
 			}
 		}
@@ -291,6 +329,23 @@ func HoverInfo(ctx context.Context, s Snapshot, pkg Package, obj types.Object, n
 	case *ast.GenDecl:
 		switch obj := obj.(type) {
 		case *types.TypeName, *types.Var, *types.Const, *types.Func:
+			// Always use the full declaration here if we have it, because the
+			// dependent code doesn't rely on pointer identity. This is fragile.
+			if d, _ := fullDecl.(*ast.GenDecl); d != nil {
+				node = d
+			}
+			// obj may not have been produced by type checking the AST containing
+			// node, so we need to be careful about using token.Pos.
+			tok := s.FileSet().File(obj.Pos())
+			offset := tok.Offset(obj.Pos())
+			tok2 := s.FileSet().File(node.Pos())
+			var spec ast.Spec
+			for _, s := range node.Specs {
+				if tok2.Offset(s.Pos()) <= offset && offset <= tok2.Offset(s.End()) {
+					spec = s
+					break
+				}
+			}
 			var err error
 			info, err = formatGenDecl(node, spec, obj, obj.Type())
 			if err != nil {
@@ -372,14 +427,6 @@ func formatGenDecl(node *ast.GenDecl, spec ast.Spec, obj types.Object, typ types
 		}
 	}
 	if spec == nil {
-		for _, s := range node.Specs {
-			if s.Pos() <= obj.Pos() && obj.Pos() <= s.End() {
-				spec = s
-				break
-			}
-		}
-	}
-	if spec == nil {
 		return nil, errors.Errorf("no spec for node %v at position %v", node, obj.Pos())
 	}
 
@@ -439,6 +486,15 @@ func formatVar(node ast.Spec, obj types.Object, decl *ast.GenDecl) *HoverInforma
 		if comment == nil {
 			comment = spec.Comment
 		}
+
+		// We need the AST nodes for variable declarations of basic literals with
+		// associated values so that we can augment their hover with more information.
+		if _, ok := obj.(*types.Var); ok && spec.Type == nil && len(spec.Values) > 0 {
+			if _, ok := spec.Values[0].(*ast.BasicLit); ok {
+				return &HoverInformation{source: spec, comment: comment}
+			}
+		}
+
 		return &HoverInformation{source: obj, comment: comment}
 	}
 

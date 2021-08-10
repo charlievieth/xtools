@@ -20,6 +20,7 @@ import (
 	"golang.org/x/tools/go/analysis"
 	"github.com/charlievieth/xtools/gocommand"
 	"github.com/charlievieth/xtools/imports"
+	"github.com/charlievieth/xtools/lsp/progress"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/span"
 	errors "golang.org/x/xerrors"
@@ -155,8 +156,17 @@ type Snapshot interface {
 	// in TypecheckWorkspace mode.
 	KnownPackages(ctx context.Context) ([]Package, error)
 
-	// WorkspacePackages returns the snapshot's top-level packages.
-	WorkspacePackages(ctx context.Context) ([]Package, error)
+	// ActivePackages returns the packages considered 'active' in the workspace.
+	//
+	// In normal memory mode, this is all workspace packages. In degraded memory
+	// mode, this is just the reverse transitive closure of open packages.
+	ActivePackages(ctx context.Context) ([]Package, error)
+
+	// Symbols returns all symbols in the snapshot.
+	Symbols(ctx context.Context) (map[span.URI][]Symbol, error)
+
+	// Metadata returns package metadata associated with the given file URI.
+	MetadataForFile(ctx context.Context, uri span.URI) ([]Metadata, error)
 
 	// GetCriticalError returns any critical errors in the workspace.
 	GetCriticalError(ctx context.Context) *CriticalError
@@ -295,6 +305,15 @@ type TidiedModule struct {
 	TidiedContent []byte
 }
 
+// Metadata represents package metadata retrieved from go/packages.
+type Metadata interface {
+	// Name is the package name.
+	Name() string
+
+	// PkgPath is the package path.
+	PkgPath() string
+}
+
 // Session represents a single connection from a client.
 // This is the level at which things like open files are maintained on behalf
 // of the client.
@@ -349,6 +368,9 @@ type Session interface {
 	// known by the view. For views within a module, this is the module root,
 	// any directory in the module root, and any replace targets.
 	FileWatchingGlobPatterns(ctx context.Context) map[string]struct{}
+
+	// SetProgressTracker sets the progress tracker for the session.
+	SetProgressTracker(tracker *progress.Tracker)
 }
 
 // Overlay is the type for a file held in memory on a session.
@@ -577,6 +599,7 @@ type Package interface {
 	Version() *module.Version
 	HasListOrParseErrors() bool
 	HasTypeErrors() bool
+	ParseMode() ParseMode
 }
 
 type CriticalError struct {

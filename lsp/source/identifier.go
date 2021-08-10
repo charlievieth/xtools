@@ -18,6 +18,7 @@ import (
 	"github.com/charlievieth/xtools/event"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/span"
+	"github.com/charlievieth/xtools/typeparams"
 	errors "golang.org/x/xerrors"
 )
 
@@ -31,6 +32,8 @@ type IdentifierInfo struct {
 		MappedRange
 		Object types.Object
 	}
+
+	Inferred *types.Signature
 
 	Declaration Declaration
 
@@ -54,10 +57,11 @@ type Declaration struct {
 
 	// The typechecked node.
 	node ast.Node
-	// Optional: the fully parsed spec, to be used for formatting in cases where
+
+	// Optional: the fully parsed node, to be used for formatting in cases where
 	// node has missing information. This could be the case when node was parsed
 	// in ParseExported mode.
-	fullSpec ast.Spec
+	fullDecl ast.Decl
 
 	// The typechecked object.
 	obj types.Object
@@ -82,6 +86,10 @@ func Identifier(ctx context.Context, snapshot Snapshot, fh FileHandle, pos proto
 		return nil, fmt.Errorf("no packages for file %v", fh.URI())
 	}
 	sort.Slice(pkgs, func(i, j int) bool {
+		// Prefer packages with a more complete parse mode.
+		if pkgs[i].ParseMode() != pkgs[j].ParseMode() {
+			return pkgs[i].ParseMode() > pkgs[j].ParseMode()
+		}
 		return len(pkgs[i].CompiledGoFiles()) < len(pkgs[j].CompiledGoFiles())
 	})
 	var findErr error
@@ -283,14 +291,15 @@ func findIdentifier(ctx context.Context, snapshot Snapshot, pkg Package, pgf *Pa
 	}
 	// Ensure that we have the full declaration, in case the declaration was
 	// parsed in ParseExported and therefore could be missing information.
-	result.Declaration.fullSpec, err = fullSpec(snapshot, result.Declaration.obj, declPkg)
-	if err != nil {
+	if result.Declaration.fullDecl, err = fullNode(snapshot, result.Declaration.obj, declPkg); err != nil {
 		return nil, err
 	}
 	typ := pkg.GetTypesInfo().TypeOf(result.ident)
 	if typ == nil {
 		return result, nil
 	}
+
+	result.Inferred = inferredSignature(pkg.GetTypesInfo(), path)
 
 	result.Type.Object = typeToObject(typ)
 	if result.Type.Object != nil {
@@ -305,10 +314,10 @@ func findIdentifier(ctx context.Context, snapshot Snapshot, pkg Package, pgf *Pa
 	return result, nil
 }
 
-// fullSpec tries to extract the full spec corresponding to obj's declaration.
+// fullNode tries to extract the full spec corresponding to obj's declaration.
 // If the package was not parsed in full, the declaration file will be
 // re-parsed to ensure it has complete syntax.
-func fullSpec(snapshot Snapshot, obj types.Object, pkg Package) (ast.Spec, error) {
+func fullNode(snapshot Snapshot, obj types.Object, pkg Package) (ast.Decl, error) {
 	// declaration in a different package... make sure we have full AST information.
 	tok := snapshot.FileSet().File(obj.Pos())
 	uri := span.URIFromPath(tok.Name())
@@ -329,12 +338,61 @@ func fullSpec(snapshot Snapshot, obj types.Object, pkg Package) (ast.Spec, error
 		}
 	}
 	path, _ := astutil.PathEnclosingInterval(file, pos, pos)
-	if len(path) > 1 {
-		if spec, _ := path[1].(*ast.TypeSpec); spec != nil {
-			return spec, nil
+	for _, n := range path {
+		if decl, ok := n.(ast.Decl); ok {
+			return decl, nil
 		}
 	}
 	return nil, nil
+}
+
+// inferredSignature determines the resolved non-generic signature for an
+// identifier with a generic signature that is the operand of an IndexExpr or
+// CallExpr.
+//
+// If no such signature exists, it returns nil.
+func inferredSignature(info *types.Info, path []ast.Node) *types.Signature {
+	if len(path) < 2 {
+		return nil
+	}
+	// There are four ways in which a signature may be resolved:
+	//  1. It has no explicit type arguments, but the CallExpr can be fully
+	//     inferred from function arguments.
+	//  2. It has full type arguments, and the IndexExpr has a non-generic type.
+	//  3. For a partially instantiated IndexExpr representing a function-valued
+	//     expression (i.e. not part of a CallExpr), type arguments may be
+	//     inferred using constraint type inference.
+	//  4. For a partially instantiated IndexExpr that is part of a CallExpr,
+	//     type arguments may be inferred using both constraint type inference
+	//     and function argument inference.
+	//
+	// These branches are handled below.
+	switch n := path[1].(type) {
+	case *ast.CallExpr:
+		_, sig := typeparams.GetInferred(info, n)
+		return sig
+	default:
+		if ix := typeparams.GetIndexExprData(n); ix != nil {
+			e := n.(ast.Expr)
+			// If the IndexExpr is fully instantiated, we consider that 'inference' for
+			// gopls' purposes.
+			sig, _ := info.TypeOf(e).(*types.Signature)
+			if sig != nil && len(typeparams.ForSignature(sig)) == 0 {
+				return sig
+			}
+			_, sig = typeparams.GetInferred(info, e)
+			if sig != nil {
+				return sig
+			}
+			if len(path) >= 2 {
+				if call, _ := path[2].(*ast.CallExpr); call != nil {
+					_, sig := typeparams.GetInferred(info, call)
+					return sig
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func searchForEnclosing(info *types.Info, path []ast.Node) types.Type {

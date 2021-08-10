@@ -52,12 +52,33 @@ type metadata struct {
 	isIntermediateTestVariant bool
 }
 
+// Name implements the source.Metadata interface.
+func (m *metadata) Name() string {
+	return string(m.name)
+}
+
+// PkgPath implements the source.Metadata interface.
+func (m *metadata) PkgPath() string {
+	return string(m.pkgPath)
+}
+
 // load calls packages.Load for the given scopes, updating package metadata,
 // import graph, and mapped files with the result.
-func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interface{}) error {
+func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interface{}) (err error) {
 	var query []string
 	var containsDir bool // for logging
 	for _, scope := range scopes {
+		if !s.shouldLoad(scope) {
+			continue
+		}
+		// Unless the context was canceled, set "shouldLoad" to false for all
+		// of the metadata we attempted to load.
+		defer func() {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			s.clearShouldLoad(scope)
+		}()
 		switch scope := scope.(type) {
 		case packagePath:
 			if source.IsCommandLineArguments(string(scope)) {
@@ -76,7 +97,12 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interf
 			}
 			query = append(query, fmt.Sprintf("file=%s", uri.Filename()))
 		case moduleLoadScope:
-			query = append(query, fmt.Sprintf("%s/...", scope))
+			switch scope {
+			case "std", "cmd":
+				query = append(query, string(scope))
+			default:
+				query = append(query, fmt.Sprintf("%s/...", scope))
+			}
 		case viewLoadScope:
 			// If we are outside of GOPATH, a module, or some other known
 			// build system, don't load subdirectories.
@@ -98,6 +124,15 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interf
 	}
 	sort.Strings(query) // for determinism
 
+	if s.view.Options().VerboseWorkDoneProgress {
+		work := s.view.session.progress.Start(ctx, "Load", fmt.Sprintf("Loading query=%s", query), nil, nil)
+		defer func() {
+			go func() {
+				work.End("Done.")
+			}()
+		}()
+	}
+
 	ctx, done := event.Start(ctx, "cache.view.load", tag.Query.Of(query))
 	defer done()
 
@@ -115,7 +150,7 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interf
 	// Set a last resort deadline on packages.Load since it calls the go
 	// command, which may hang indefinitely if it has a bug. golang/go#42132
 	// and golang/go#42255 have more context.
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
 	cfg := s.config(ctx, inv)
@@ -169,7 +204,9 @@ func (s *snapshot) load(ctx context.Context, allowNetwork bool, scopes ...interf
 			continue
 		}
 		// Set the metadata for this package.
-		m, err := s.setMetadata(ctx, packagePath(pkg.PkgPath), pkg, cfg, map[packageID]struct{}{})
+		s.mu.Lock()
+		m, err := s.setMetadataLocked(ctx, packagePath(pkg.PkgPath), pkg, cfg, map[packageID]struct{}{})
+		s.mu.Unlock()
 		if err != nil {
 			return err
 		}
@@ -363,10 +400,10 @@ func getWorkspaceDir(ctx context.Context, h *memoize.Handle, g *memoize.Generati
 	return span.URIFromPath(v.(*workspaceDirData).dir), nil
 }
 
-// setMetadata extracts metadata from pkg and records it in s. It
+// setMetadataLocked extracts metadata from pkg and records it in s. It
 // recurses through pkg.Imports to ensure that metadata exists for all
 // dependencies.
-func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *packages.Package, cfg *packages.Config, seen map[packageID]struct{}) (*metadata, error) {
+func (s *snapshot) setMetadataLocked(ctx context.Context, pkgPath packagePath, pkg *packages.Package, cfg *packages.Config, seen map[packageID]struct{}) (*metadata, error) {
 	id := packageID(pkg.ID)
 	if _, ok := seen[id]; ok {
 		return nil, errors.Errorf("import cycle detected: %q", id)
@@ -393,16 +430,18 @@ func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *pa
 		m.errors = append(m.errors, err)
 	}
 
+	uris := map[span.URI]struct{}{}
 	for _, filename := range pkg.CompiledGoFiles {
 		uri := span.URIFromPath(filename)
 		m.compiledGoFiles = append(m.compiledGoFiles, uri)
-		s.addID(uri, m.id)
+		uris[uri] = struct{}{}
 	}
 	for _, filename := range pkg.GoFiles {
 		uri := span.URIFromPath(filename)
 		m.goFiles = append(m.goFiles, uri)
-		s.addID(uri, m.id)
+		uris[uri] = struct{}{}
 	}
+	s.updateIDForURIsLocked(id, uris)
 
 	// TODO(rstambler): is this still necessary?
 	copied := map[packageID]struct{}{
@@ -425,24 +464,30 @@ func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *pa
 			m.missingDeps[importPkgPath] = struct{}{}
 			continue
 		}
-		if s.getMetadata(importID) == nil {
-			if _, err := s.setMetadata(ctx, importPkgPath, importPkg, cfg, copied); err != nil {
+		if s.noValidMetadataForIDLocked(importID) {
+			if _, err := s.setMetadataLocked(ctx, importPkgPath, importPkg, cfg, copied); err != nil {
 				event.Error(ctx, "error in dependency", err)
 			}
 		}
 	}
 
 	// Add the metadata to the cache.
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	// TODO: We should make sure not to set duplicate metadata,
-	// and instead panic here. This can be done by making sure not to
-	// reset metadata information for packages we've already seen.
-	if original, ok := s.metadata[m.id]; ok {
-		m = original
+	// If we've already set the metadata for this snapshot, reuse it.
+	if original, ok := s.metadata[m.id]; ok && original.valid {
+		// Since we've just reloaded, clear out shouldLoad.
+		original.shouldLoad = false
+		m = original.metadata
 	} else {
-		s.metadata[m.id] = m
+		s.metadata[m.id] = &knownMetadata{
+			metadata: m,
+			valid:    true,
+		}
+		// Invalidate any packages we may have associated with this metadata.
+		for _, mode := range []source.ParseMode{source.ParseHeader, source.ParseExported, source.ParseFull} {
+			key := packageKey{mode, m.id}
+			delete(s.packages, key)
+		}
 	}
 
 	// Set the workspace packages. If any of the package's files belong to the

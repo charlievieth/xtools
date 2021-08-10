@@ -59,7 +59,7 @@ func (s *snapshot) parseGoHandle(ctx context.Context, fh source.FileHandle, mode
 	}
 	parseHandle := s.generation.Bind(key, func(ctx context.Context, arg memoize.Arg) interface{} {
 		snapshot := arg.(*snapshot)
-		return parseGo(ctx, snapshot.view.session.cache.fset, fh, mode)
+		return parseGo(ctx, snapshot.FileSet(), fh, mode)
 	}, nil)
 
 	pgh := &parseGoHandle{
@@ -1070,7 +1070,17 @@ func fixArrayType(bad *ast.BadExpr, parent ast.Node, tok *token.File, src []byte
 
 	exprBytes := make([]byte, 0, int(to-from)+3)
 	// Avoid doing tok.Offset(to) since that panics if badExpr ends at EOF.
-	exprBytes = append(exprBytes, src[tok.Offset(from):tok.Offset(to-1)+1]...)
+	// It also panics if the position is not in the range of the file, and
+	// badExprs may not necessarily have good positions, so check first.
+	if !source.InRange(tok, from) {
+		return false
+	}
+	if !source.InRange(tok, to-1) {
+		return false
+	}
+	fromOffset := tok.Offset(from)
+	toOffset := tok.Offset(to-1) + 1
+	exprBytes = append(exprBytes, src[fromOffset:toOffset]...)
 	exprBytes = bytes.TrimSpace(exprBytes)
 
 	// If our expression ends in "]" (e.g. "[]"), add a phantom selector

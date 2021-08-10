@@ -145,6 +145,19 @@ var GeneratedAPIJSON = &APIJSON{
 				Hierarchy:  "build",
 			},
 			{
+				Name: "experimentalUseInvalidMetadata",
+				Type: "bool",
+				Doc:  "experimentalUseInvalidMetadata enables gopls to fall back on outdated\npackage metadata to provide editor features if the go command fails to\nload packages for some reason (like an invalid go.mod file). This will\neventually be the default behavior, and this setting will be removed.\n",
+				EnumKeys: EnumKeys{
+					ValueType: "",
+					Keys:      nil,
+				},
+				EnumValues: nil,
+				Default:    "false",
+				Status:     "experimental",
+				Hierarchy:  "build",
+			},
+			{
 				Name: "hoverKind",
 				Type: "enum",
 				Doc:  "hoverKind controls the information that appears in the hover text.\nSingleLine and Structured are intended for use only by authors of editor plugins.\n",
@@ -310,6 +323,10 @@ var GeneratedAPIJSON = &APIJSON{
 					},
 					{
 						Value: "\"CaseSensitive\"",
+						Doc:   "",
+					},
+					{
+						Value: "\"FastFuzzy\"",
 						Doc:   "",
 					},
 					{
@@ -614,15 +631,28 @@ var GeneratedAPIJSON = &APIJSON{
 				Hierarchy:  "ui.diagnostic",
 			},
 			{
-				Name: "experimentalDiagnosticsDelay",
+				Name: "diagnosticsDelay",
 				Type: "time.Duration",
-				Doc:  "experimentalDiagnosticsDelay controls the amount of time that gopls waits\nafter the most recent file modification before computing deep diagnostics.\nSimple diagnostics (parsing and type-checking) are always run immediately\non recently modified packages.\n\nThis option must be set to a valid duration string, for example `\"250ms\"`.\n",
+				Doc:  "diagnosticsDelay controls the amount of time that gopls waits\nafter the most recent file modification before computing deep diagnostics.\nSimple diagnostics (parsing and type-checking) are always run immediately\non recently modified packages.\n\nThis option must be set to a valid duration string, for example `\"250ms\"`.\n",
 				EnumKeys: EnumKeys{
 					ValueType: "",
 					Keys:      nil,
 				},
 				EnumValues: nil,
 				Default:    "\"250ms\"",
+				Status:     "advanced",
+				Hierarchy:  "ui.diagnostic",
+			},
+			{
+				Name: "experimentalWatchedFileDelay",
+				Type: "time.Duration",
+				Doc:  "experimentalWatchedFileDelay controls the amount of time that gopls waits\nfor additional workspace/didChangeWatchedFiles notifications to arrive,\nbefore processing all such notifications in a single batch. This is\nintended for use by LSP clients that don't support their own batching of\nfile system notifications.\n\nThis option must be set to a valid duration string, for example `\"100ms\"`.\n",
+				EnumKeys: EnumKeys{
+					ValueType: "",
+					Keys:      nil,
+				},
+				EnumValues: nil,
+				Default:    "\"0s\"",
 				Status:     "experimental",
 				Hierarchy:  "ui.diagnostic",
 			},
