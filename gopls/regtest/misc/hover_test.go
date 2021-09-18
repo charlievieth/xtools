@@ -1,3 +1,4 @@
+//go:build gopls_test
 // +build gopls_test
 
 // Copyright 2021 The Go Authors. All rights reserved.
@@ -99,5 +100,19 @@ func main() {
 		if got != nil && !strings.Contains(got.Value, binExpected) {
 			t.Errorf("Hover: missing expected field '%s'. Got:\n%q", binExpected, got.Value)
 		}
+	})
+}
+
+// Tests that hovering does not trigger the panic in golang/go#48249.
+func TestPanicInHoverBrokenCode(t *testing.T) {
+	testenv.NeedsGo1Point(t, 13)
+	const source = `
+-- main.go --
+package main
+
+type Example struct`
+	Run(t, source, func(t *testing.T, env *Env) {
+		env.OpenFile("main.go")
+		env.Editor.Hover(env.Ctx, "main.go", env.RegexpSearch("main.go", "Example"))
 	})
 }

@@ -88,7 +88,6 @@ func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocu
 	if err != nil {
 		return nil, err
 	}
-	info := pkg.GetTypesInfo()
 	pgf, err := pkg.File(fh.URI())
 	if err != nil {
 		return nil, err
@@ -103,7 +102,8 @@ func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocu
 		ctx:      ctx,
 		pgf:      pgf,
 		rng:      rng,
-		ti:       info,
+		ti:       pkg.GetTypesInfo(),
+		pkg:      pkg,
 		fset:     snapshot.FileSet(),
 		tokTypes: s.session.Options().SemanticTypes,
 		tokMods:  s.session.Options().SemanticMods,
@@ -155,7 +155,7 @@ const (
 	tokInterface tokenType = "interface"
 	tokParameter tokenType = "parameter"
 	tokVariable  tokenType = "variable"
-	tokMember    tokenType = "member"
+	tokMethod    tokenType = "method"
 	tokFunction  tokenType = "function"
 	tokKeyword   tokenType = "keyword"
 	tokComment   tokenType = "comment"
@@ -220,6 +220,8 @@ type encoded struct {
 	pgf               *source.ParsedGoFile
 	rng               *protocol.Range
 	ti                *types.Info
+	types             *types.Package
+	pkg               source.Package
 	fset              *token.FileSet
 	// allowed starting and ending token.Pos, set by init
 	// used to avoid looking at declarations not in range
@@ -238,14 +240,21 @@ func (e *encoded) strStack() string {
 		loc := e.stack[len(e.stack)-1].Pos()
 		if !source.InRange(e.pgf.Tok, loc) {
 			msg = append(msg, fmt.Sprintf("invalid position %v for %s", loc, e.pgf.URI))
-		} else {
+		} else if locInRange(e.pgf.Tok, loc) {
 			add := e.pgf.Tok.PositionFor(loc, false)
 			nm := filepath.Base(add.Filename)
 			msg = append(msg, fmt.Sprintf("(%s:%d,col:%d)", nm, add.Line, add.Column))
+		} else {
+			msg = append(msg, fmt.Sprintf("(loc %d out of range)", loc))
 		}
 	}
 	msg = append(msg, "]")
 	return strings.Join(msg, " ")
+}
+
+// avoid panic in token.PostionFor() when typing at the end of the file
+func locInRange(f *token.File, loc token.Pos) bool {
+	return f.Base() <= int(loc) && int(loc) < f.Base()+f.Size()
 }
 
 // find the line in the source
@@ -417,6 +426,10 @@ func (e *encoded) inspector(n ast.Node) bool {
 }
 
 func (e *encoded) ident(x *ast.Ident) {
+	if e.ti == nil {
+		e.unkIdent(x)
+		return
+	}
 	def := e.ti.Defs[x]
 	if def != nil {
 		what, mods := e.definitionFor(x)
@@ -498,6 +511,7 @@ func (e *encoded) unkIdent(x *ast.Ident) {
 	case *ast.BinaryExpr, *ast.UnaryExpr, *ast.ParenExpr, *ast.StarExpr,
 		*ast.IncDecStmt, *ast.SliceExpr, *ast.ExprStmt, *ast.IndexExpr,
 		*ast.ReturnStmt,
+		*ast.ForStmt,      // possibly incomplete
 		*ast.IfStmt,       /* condition */
 		*ast.KeyValueExpr: // either key or value
 		tok(tokVariable, nil)
@@ -584,7 +598,7 @@ func (e *encoded) unkIdent(x *ast.Ident) {
 			_, okit := e.stack[n-2].(*ast.InterfaceType)
 			_, okfl := e.stack[n-1].(*ast.FieldList)
 			if okit && okfl {
-				tok(tokMember, def)
+				tok(tokMethod, def)
 				return
 			}
 		}
@@ -631,7 +645,7 @@ func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
 			if x.Name == "_" {
 				return "", nil // not really a variable
 			}
-			return "variable", mods
+			return tokVariable, mods
 		case *ast.GenDecl:
 			if isDeprecated(y.Doc) {
 				mods = append(mods, "deprecated")
@@ -647,7 +661,7 @@ func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
 					mods = append(mods, "deprecated")
 				}
 				if y.Recv != nil {
-					return tokMember, mods
+					return tokMethod, mods
 				}
 				return tokFunction, mods
 			}
@@ -657,8 +671,10 @@ func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
 			}
 			// if x < ... < FieldList < FuncType < FuncDecl, this is a param
 			return tokParameter, mods
+		case *ast.FuncType:
+			return tokParameter, mods
 		case *ast.InterfaceType:
-			return tokMember, mods
+			return tokMethod, mods
 		case *ast.TypeSpec:
 			// GenDecl/Typespec/FuncType/FieldList/Field/Ident
 			// (type A func(b uint64)) (err error)
@@ -779,16 +795,10 @@ func (e *encoded) importSpec(d *ast.ImportSpec) {
 	// a local package name or the last component of the Path
 	if d.Name != nil {
 		nm := d.Name.String()
-		// import . x => x is not a namespace
-		// import _ x => x is a namespace
 		if nm != "_" && nm != "." {
 			e.token(d.Name.Pos(), len(nm), tokNamespace, nil)
-			return
 		}
-		if nm == "." {
-			return
-		}
-		// and fall through for _
+		return // don't mark anything for . or _
 	}
 	val := d.Path.Value
 	if len(val) < 2 || val[0] != '"' || val[len(val)-1] != '"' {
@@ -796,11 +806,25 @@ func (e *encoded) importSpec(d *ast.ImportSpec) {
 		return
 	}
 	nm := val[1 : len(val)-1] // remove surrounding "s
-	nm = filepath.Base(nm)
-	// in import "lib/math", 'math' is the package name
-	start := d.Path.End() - token.Pos(1+len(nm))
-	e.token(start, len(nm), tokNamespace, nil)
-	// There may be more cases, as import strings are implementation defined.
+	// Import strings are implementation defined. Try to match with parse information.
+	x, err := e.pkg.GetImport(nm)
+	if err != nil {
+		// unexpected, but impact is that maybe some import is not colored
+		return
+	}
+	// expect that nm is x.PkgPath and that x.Name() is a component of it
+	if x.PkgPath() != nm {
+		// don't know how or what to color (if this can happen at all)
+		return
+	}
+	// this is not a precise test: imagine "github.com/nasty/v/v2"
+	j := strings.LastIndex(nm, x.Name())
+	if j == -1 {
+		// name doesn't show up, for whatever reason, so nothing to report
+		return
+	}
+	start := d.Path.Pos() + 1 + token.Pos(j) // skip the initial quote
+	e.token(start, len(x.Name()), tokNamespace, nil)
 }
 
 // log unexpected state
@@ -856,7 +880,7 @@ var (
 	semanticTypes = [...]string{
 		"namespace", "type", "class", "enum", "interface",
 		"struct", "typeParameter", "parameter", "variable", "property", "enumMember",
-		"event", "function", "member", "macro", "keyword", "modifier", "comment",
+		"event", "function", "method", "macro", "keyword", "modifier", "comment",
 		"string", "number", "regexp", "operator",
 	}
 	semanticModifiers = [...]string{

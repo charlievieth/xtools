@@ -1,3 +1,4 @@
+//go:build gopls_test
 // +build gopls_test
 
 // Copyright 2020 The Go Authors. All rights reserved.
@@ -44,9 +45,7 @@ func benchmarkOptions(dir string) []RunOption {
 }
 
 func printBenchmarkResults(result testing.BenchmarkResult) {
-	fmt.Println("Benchmark Statistics:")
-	fmt.Println(result.String())
-	fmt.Println(result.MemString())
+	fmt.Printf("BenchmarkStatistics\t%s\t%s\n", result.String(), result.MemString())
 }
 
 var iwlOptions struct {

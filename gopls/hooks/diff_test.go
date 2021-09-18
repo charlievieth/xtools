@@ -1,3 +1,4 @@
+//go:build gopls_test
 // +build gopls_test
 
 // Copyright 2019 The Go Authors. All rights reserved.

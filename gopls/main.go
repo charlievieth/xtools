@@ -1,3 +1,4 @@
+//go:build never
 // +build never
 
 // Copyright 2019 The Go Authors. All rights reserved.
