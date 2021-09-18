@@ -13,7 +13,6 @@ FROM=golang.org/x/tools
 PKG=github.com/charlievieth/xtools
 TO="$PKG"
 
-
 escape_import_path() {
     sed -e 's/\./\\\./g' -e 's/\//\\\//g' <<<"$1"
 }
@@ -112,6 +111,9 @@ while IFS='' read -r -d '' file; do
 done < <(find ./gopls -type f -name '*_test.go' -print0)
 
 git add ./gopls
+
+# remove vendor directory before running any modules commands
+[ -d ./vendor ] && rm -r ./vendor
 
 # pull the latest tools since gopls depends on them
 GO111MODULE=on go get golang.org/x/tools@master
