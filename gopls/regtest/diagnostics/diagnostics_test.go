@@ -970,6 +970,8 @@ const C = a.A
 // This is a copy of the scenario_default/quickfix_empty_files.txt test from
 // govim. Reproduces golang/go#39646.
 func TestQuickFixEmptyFiles(t *testing.T) {
+	t.Skip("too flaky: golang/go#48773")
+
 	testenv.NeedsGo1Point(t, 15)
 
 	const mod = `
@@ -1512,6 +1514,7 @@ package foo_
 // TestProgressBarErrors confirms that critical workspace load errors are shown
 // and updated via progress reports.
 func TestProgressBarErrors(t *testing.T) {
+	t.Skip("too flaky: golang/go#46930")
 	testenv.NeedsGo1Point(t, 14)
 
 	const pkg = `

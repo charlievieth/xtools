@@ -9,9 +9,14 @@ import (
 
 	"golang.org/x/tools/go/analysis/analysistest"
 	"github.com/charlievieth/xtools/lsp/analysis/unusedparams"
+	"github.com/charlievieth/xtools/typeparams"
 )
 
 func Test(t *testing.T) {
 	testdata := analysistest.TestData()
-	analysistest.Run(t, testdata, unusedparams.Analyzer, "a")
+	tests := []string{"a"}
+	if typeparams.Enabled {
+		tests = append(tests, "typeparams")
+	}
+	analysistest.Run(t, testdata, unusedparams.Analyzer, tests...)
 }

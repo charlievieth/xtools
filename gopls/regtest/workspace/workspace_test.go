@@ -12,11 +12,13 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/charlievieth/xtools/gopls/hooks"
 	. "github.com/charlievieth/xtools/lsp/regtest"
+	"github.com/charlievieth/xtools/lsp/source"
 
 	"github.com/charlievieth/xtools/lsp/command"
 	"github.com/charlievieth/xtools/lsp/fake"
@@ -134,6 +136,38 @@ func TestReferences(t *testing.T) {
 				want := 3
 				if got := len(locations); got != want {
 					t.Fatalf("expected %v locations, got %v", want, got)
+				}
+			})
+		})
+	}
+}
+
+// make sure that directory filters work
+func TestFilters(t *testing.T) {
+	for _, tt := range []struct {
+		name, rootPath string
+	}{
+		{
+			name:     "module root",
+			rootPath: "pkg",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := []RunOption{ProxyFiles(workspaceProxy)}
+			if tt.rootPath != "" {
+				opts = append(opts, WorkspaceFolders(tt.rootPath))
+			}
+			f := func(o *source.Options) {
+				o.DirectoryFilters = append(o.DirectoryFilters, "-inner")
+			}
+			opts = append(opts, Options(f))
+			WithOptions(opts...).Run(t, workspaceModule, func(t *testing.T, env *Env) {
+				syms := env.WorkspaceSymbol("Hi")
+				sort.Slice(syms, func(i, j int) bool { return syms[i].ContainerName < syms[j].ContainerName })
+				for i, s := range syms {
+					if strings.Contains(s.ContainerName, "/inner") {
+						t.Errorf("%s %v %s %s %d\n", s.Name, s.Kind, s.ContainerName, tt.name, i)
+					}
 				}
 			})
 		})
@@ -659,7 +693,6 @@ directory (
 `
 	WithOptions(
 		ProxyFiles(workspaceModuleProxy),
-		Modes(Experimental),
 	).Run(t, multiModule, func(t *testing.T, env *Env) {
 		// Initially, the gopls.mod should cause only the a.com module to be
 		// loaded. Validate this by jumping to a definition in b.com and ensuring
@@ -1081,6 +1114,48 @@ package main
 			// even though there are technically multiple go.mod files in the
 			// worskpace.
 			LogMatching(protocol.Info, ".*valid build configuration = true.*", 1, false),
+		)
+	})
+}
+
+func TestAddGoWork(t *testing.T) {
+	const nomod = `
+-- a/go.mod --
+module a.com
+
+go 1.16
+-- a/main.go --
+package main
+
+func main() {}
+-- b/go.mod --
+module b.com
+
+go 1.16
+-- b/main.go --
+package main
+
+func main() {}
+`
+	WithOptions(
+		Modes(Singleton),
+	).Run(t, nomod, func(t *testing.T, env *Env) {
+		env.OpenFile("a/main.go")
+		env.OpenFile("b/main.go")
+		env.Await(
+			DiagnosticAt("a/main.go", 0, 0),
+			DiagnosticAt("b/main.go", 0, 0),
+		)
+		env.WriteWorkspaceFile("go.work", `go 1.16
+
+directory (
+	a
+	b
+)
+`)
+		env.Await(
+			EmptyDiagnostics("a/main.go"),
+			EmptyDiagnostics("b/main.go"),
 		)
 	})
 }

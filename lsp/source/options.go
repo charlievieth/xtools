@@ -49,6 +49,7 @@ import (
 	"golang.org/x/tools/go/analysis/passes/unusedwrite"
 	"github.com/charlievieth/xtools/lsp/analysis/fillreturns"
 	"github.com/charlievieth/xtools/lsp/analysis/fillstruct"
+	"github.com/charlievieth/xtools/lsp/analysis/infertypeargs"
 	"github.com/charlievieth/xtools/lsp/analysis/nonewvars"
 	"github.com/charlievieth/xtools/lsp/analysis/noresultvalues"
 	"github.com/charlievieth/xtools/lsp/analysis/simplifycompositelit"
@@ -56,6 +57,7 @@ import (
 	"github.com/charlievieth/xtools/lsp/analysis/simplifyslice"
 	"github.com/charlievieth/xtools/lsp/analysis/undeclaredname"
 	"github.com/charlievieth/xtools/lsp/analysis/unusedparams"
+	"github.com/charlievieth/xtools/lsp/analysis/useany"
 	"github.com/charlievieth/xtools/lsp/command"
 	"github.com/charlievieth/xtools/lsp/diff"
 	"github.com/charlievieth/xtools/lsp/diff/myers"
@@ -79,13 +81,14 @@ func DefaultOptions() *Options {
 		}
 		defaultOptions = &Options{
 			ClientOptions: ClientOptions{
-				InsertTextFormat:                  protocol.PlainTextTextFormat,
-				PreferredContentFormat:            protocol.Markdown,
-				ConfigurationSupported:            true,
-				DynamicConfigurationSupported:     true,
-				DynamicWatchedFilesSupported:      true,
-				LineFoldingOnly:                   false,
-				HierarchicalDocumentSymbolSupport: true,
+				InsertTextFormat:                           protocol.PlainTextTextFormat,
+				PreferredContentFormat:                     protocol.Markdown,
+				ConfigurationSupported:                     true,
+				DynamicConfigurationSupported:              true,
+				DynamicRegistrationSemanticTokensSupported: true,
+				DynamicWatchedFilesSupported:               true,
+				LineFoldingOnly:                            false,
+				HierarchicalDocumentSymbolSupport:          true,
 			},
 			ServerOptions: ServerOptions{
 				SupportedCodeActions: map[FileKind]map[protocol.CodeActionKind]bool{
@@ -181,18 +184,19 @@ type Options struct {
 // ClientOptions holds LSP-specific configuration that is provided by the
 // client.
 type ClientOptions struct {
-	InsertTextFormat                  protocol.InsertTextFormat
-	ConfigurationSupported            bool
-	DynamicConfigurationSupported     bool
-	DynamicWatchedFilesSupported      bool
-	PreferredContentFormat            protocol.MarkupKind
-	LineFoldingOnly                   bool
-	HierarchicalDocumentSymbolSupport bool
-	SemanticTypes                     []string
-	SemanticMods                      []string
-	RelatedInformationSupported       bool
-	CompletionTags                    bool
-	CompletionDeprecated              bool
+	InsertTextFormat                           protocol.InsertTextFormat
+	ConfigurationSupported                     bool
+	DynamicConfigurationSupported              bool
+	DynamicRegistrationSemanticTokensSupported bool
+	DynamicWatchedFilesSupported               bool
+	PreferredContentFormat                     protocol.MarkupKind
+	LineFoldingOnly                            bool
+	HierarchicalDocumentSymbolSupport          bool
+	SemanticTypes                              []string
+	SemanticMods                               []string
+	RelatedInformationSupported                bool
+	CompletionTags                             bool
+	CompletionDeprecated                       bool
 }
 
 // ServerOptions holds LSP-specific configuration that is provided by the
@@ -653,6 +657,7 @@ func (o *Options) ForClientCapabilities(caps protocol.ClientCapabilities) {
 	// Check if the client supports configuration messages.
 	o.ConfigurationSupported = caps.Workspace.Configuration
 	o.DynamicConfigurationSupported = caps.Workspace.DidChangeConfiguration.DynamicRegistration
+	o.DynamicRegistrationSemanticTokensSupported = caps.TextDocument.SemanticTokens.DynamicRegistration
 	o.DynamicWatchedFilesSupported = caps.Workspace.DidChangeWatchedFiles.DynamicRegistration
 
 	// Check which types of content format are supported by this client.
@@ -1236,6 +1241,8 @@ func defaultAnalyzers() map[string]*Analyzer {
 		testinggoroutine.Analyzer.Name: {Analyzer: testinggoroutine.Analyzer, Enabled: true},
 		unusedparams.Analyzer.Name:     {Analyzer: unusedparams.Analyzer, Enabled: false},
 		unusedwrite.Analyzer.Name:      {Analyzer: unusedwrite.Analyzer, Enabled: false},
+		useany.Analyzer.Name:           {Analyzer: useany.Analyzer, Enabled: true},
+		infertypeargs.Analyzer.Name:    {Analyzer: infertypeargs.Analyzer, Enabled: true},
 
 		// gofmt -s suite:
 		simplifycompositelit.Analyzer.Name: {

@@ -103,7 +103,7 @@ func (s *Server) initialize(ctx context.Context, params *protocol.ParamInitializ
 		if dep.Path == "github.com/sergi/go-diff" && dep.Version == "v1.2.0" {
 			if err := s.eventuallyShowMessage(ctx, &protocol.ShowMessageParams{
 				Message: `It looks like you have a bad gopls installation.
-Please reinstall gopls by running 'GO111MODULE=on go get golang.org/x/tools/gopls@latest'.
+Please reinstall gopls by running 'GO111MODULE=on go install golang.org/x/tools/gopls@latest'.
 See https://github.com/golang/go/issues/45732 for more information.`,
 				Type: protocol.Error,
 			}); err != nil {
@@ -188,20 +188,17 @@ func (s *Server) initialized(ctx context.Context, params *protocol.InitializedPa
 	}
 	s.pendingFolders = nil
 
+	var registrations []protocol.Registration
 	if options.ConfigurationSupported && options.DynamicConfigurationSupported {
-		registrations := []protocol.Registration{
-			{
-				ID:     "workspace/didChangeConfiguration",
-				Method: "workspace/didChangeConfiguration",
-			},
-			{
-				ID:     "workspace/didChangeWorkspaceFolders",
-				Method: "workspace/didChangeWorkspaceFolders",
-			},
-		}
-		if options.SemanticTokens {
-			registrations = append(registrations, semanticTokenRegistration(options.SemanticTypes, options.SemanticMods))
-		}
+		registrations = append(registrations, protocol.Registration{
+			ID:     "workspace/didChangeConfiguration",
+			Method: "workspace/didChangeConfiguration",
+		})
+	}
+	if options.SemanticTokens && options.DynamicRegistrationSemanticTokensSupported {
+		registrations = append(registrations, semanticTokenRegistration(options.SemanticTypes, options.SemanticMods))
+	}
+	if len(registrations) > 0 {
 		if err := s.client.RegisterCapability(ctx, &protocol.RegistrationParams{
 			Registrations: registrations,
 		}); err != nil {
@@ -235,6 +232,9 @@ func (s *Server) addFolders(ctx context.Context, folders []protocol.WorkspaceFol
 		}
 		work := s.progress.Start(ctx, "Setting up workspace", "Loading packages...", nil, nil)
 		snapshot, release, err := s.addView(ctx, folder.Name, uri)
+		if err == source.ErrViewExists {
+			continue
+		}
 		if err != nil {
 			viewErrors[uri] = err
 			work.End(fmt.Sprintf("Error loading packages: %s", err))

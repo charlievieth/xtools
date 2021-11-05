@@ -36,7 +36,7 @@ directory that is both outside of your `GOPATH` and outside of a module (a temp
 directory is fine), and run:
 
 ```sh
-GO111MODULE=on go get github.com/charlievieth/xtools/gopls@latest
+go install github.com/charlievieth/xtools/gopls@latest
 ```
 
 **NOTE**: Do not use the `-u` flag, as it will update your dependencies to

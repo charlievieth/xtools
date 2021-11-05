@@ -9,9 +9,14 @@ import (
 
 	"golang.org/x/tools/go/analysis/analysistest"
 	"github.com/charlievieth/xtools/lsp/analysis/simplifyslice"
+	"github.com/charlievieth/xtools/typeparams"
 )
 
 func Test(t *testing.T) {
 	testdata := analysistest.TestData()
-	analysistest.RunWithSuggestedFixes(t, testdata, simplifyslice.Analyzer, "a")
+	tests := []string{"a"}
+	if typeparams.Enabled {
+		tests = append(tests, "typeparams")
+	}
+	analysistest.RunWithSuggestedFixes(t, testdata, simplifyslice.Analyzer, tests...)
 }
