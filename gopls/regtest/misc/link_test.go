@@ -18,6 +18,7 @@ import (
 
 func TestHoverAndDocumentLink(t *testing.T) {
 	testenv.NeedsGo1Point(t, 13)
+
 	const program = `
 -- go.mod --
 module mod.test
@@ -34,6 +35,8 @@ package main
 import "import.test/pkg"
 
 func main() {
+	// Issue 43990: this is not a link that most users can open from an LSP
+	// client: mongodb://not.a.link.com
 	println(pkg.Hello)
 }`
 
@@ -75,7 +78,9 @@ const Hello = "Hello"
 		}
 
 		// Then change the environment to make these links private.
-		env.ChangeEnv(map[string]string{"GOPRIVATE": "import.test"})
+		cfg := env.Editor.Config()
+		cfg.Env = map[string]string{"GOPRIVATE": "import.test"}
+		env.ChangeConfiguration(cfg)
 
 		// Finally, verify that the links are gone.
 		content, _ = env.Hover("main.go", env.RegexpSearch("main.go", "pkg.Hello"))

@@ -8,12 +8,14 @@ import (
 	"os"
 	"testing"
 
+	"github.com/charlievieth/xtools/lsp/bug"
 	cmdtest "github.com/charlievieth/xtools/lsp/cmd/test"
 	"github.com/charlievieth/xtools/lsp/tests"
 	"github.com/charlievieth/xtools/testenv"
 )
 
 func TestMain(m *testing.M) {
+	bug.PanicOnBugs = true
 	testenv.ExitIfSmallMachine()
 	os.Exit(m.Run())
 }

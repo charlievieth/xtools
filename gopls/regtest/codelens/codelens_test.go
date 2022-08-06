@@ -9,22 +9,20 @@ package codelens
 
 import (
 	"fmt"
-	"runtime"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/charlievieth/xtools/gopls/hooks"
+	"github.com/charlievieth/xtools/lsp/bug"
 	. "github.com/charlievieth/xtools/lsp/regtest"
 
 	"github.com/charlievieth/xtools/lsp/command"
-	"github.com/charlievieth/xtools/lsp/fake"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/tests"
 	"github.com/charlievieth/xtools/testenv"
 )
 
 func TestMain(m *testing.M) {
+	bug.PanicOnBugs = true
 	Main(m, hooks.Options)
 }
 
@@ -65,9 +63,7 @@ const (
 	for _, test := range tests {
 		t.Run(test.label, func(t *testing.T) {
 			WithOptions(
-				EditorConfig{
-					CodeLenses: test.enabled,
-				},
+				Settings{"codelenses": test.enabled},
 			).Run(t, workspace, func(t *testing.T, env *Env) {
 				env.OpenFile("lib.go")
 				lens := env.CodeLens("lib.go")
@@ -286,74 +282,5 @@ func Foo() {
 		// Regenerate cgo, fixing the diagnostic.
 		env.ExecuteCodeLensCommand("cgo.go", command.RegenerateCgo)
 		env.Await(EmptyDiagnostics("cgo.go"))
-	})
-}
-
-func TestGCDetails(t *testing.T) {
-	testenv.NeedsGo1Point(t, 15)
-	if runtime.GOOS == "android" {
-		t.Skipf("the gc details code lens doesn't work on Android")
-	}
-
-	const mod = `
--- go.mod --
-module mod.com
-
-go 1.15
--- main.go --
-package main
-
-import "fmt"
-
-func main() {
-	fmt.Println(42)
-}
-`
-	WithOptions(
-		EditorConfig{
-			CodeLenses: map[string]bool{
-				"gc_details": true,
-			}},
-		// TestGCDetails seems to suffer from poor performance on certain builders. Give it some more time to complete.
-		Timeout(60*time.Second),
-	).Run(t, mod, func(t *testing.T, env *Env) {
-		env.OpenFile("main.go")
-		env.ExecuteCodeLensCommand("main.go", command.GCDetails)
-		d := &protocol.PublishDiagnosticsParams{}
-		env.Await(
-			OnceMet(
-				DiagnosticAt("main.go", 5, 13),
-				ReadDiagnostics("main.go", d),
-			),
-		)
-		// Confirm that the diagnostics come from the gc details code lens.
-		var found bool
-		for _, d := range d.Diagnostics {
-			if d.Severity != protocol.SeverityInformation {
-				t.Fatalf("unexpected diagnostic severity %v, wanted Information", d.Severity)
-			}
-			if strings.Contains(d.Message, "42 escapes") {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf(`expected to find diagnostic with message "escape(42 escapes to heap)", found none`)
-		}
-
-		// Editing a buffer should cause gc_details diagnostics to disappear, since
-		// they only apply to saved buffers.
-		env.EditBuffer("main.go", fake.NewEdit(0, 0, 0, 0, "\n\n"))
-		env.Await(EmptyDiagnostics("main.go"))
-
-		// Saving a buffer should re-format back to the original state, and
-		// re-enable the gc_details diagnostics.
-		env.SaveBuffer("main.go")
-		env.Await(DiagnosticAt("main.go", 5, 13))
-
-		// Toggle the GC details code lens again so now it should be off.
-		env.ExecuteCodeLensCommand("main.go", command.GCDetails)
-		env.Await(
-			EmptyDiagnostics("main.go"),
-		)
 	})
 }

@@ -6,6 +6,7 @@ package lsp
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
@@ -18,7 +19,7 @@ func (s *Server) definition(ctx context.Context, params *protocol.DefinitionPara
 	if !ok {
 		return nil, err
 	}
-	if fh.Kind() == source.Tmpl {
+	if snapshot.View().FileKind(fh) == source.Tmpl {
 		return template.Definition(snapshot, fh, params.Position)
 	}
 	ident, err := source.Identifier(ctx, snapshot, fh, params.Position)
@@ -53,6 +54,9 @@ func (s *Server) typeDefinition(ctx context.Context, params *protocol.TypeDefini
 	ident, err := source.Identifier(ctx, snapshot, fh, params.Position)
 	if err != nil {
 		return nil, err
+	}
+	if ident.Type.Object == nil {
+		return nil, fmt.Errorf("no type definition for %s", ident.Name)
 	}
 	identRange, err := ident.Type.Range()
 	if err != nil {

@@ -13,6 +13,7 @@ import (
 	"go/scanner"
 	"go/token"
 	"go/types"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -22,10 +23,9 @@ import (
 	"github.com/charlievieth/xtools/lsp/diff"
 	"github.com/charlievieth/xtools/lsp/diff/myers"
 	"github.com/charlievieth/xtools/lsp/protocol"
+	"github.com/charlievieth/xtools/lsp/safetoken"
 	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/memoize"
-	"github.com/charlievieth/xtools/span"
-	errors "golang.org/x/xerrors"
 )
 
 // parseKey uniquely identifies a parsed Go file.
@@ -34,224 +34,90 @@ type parseKey struct {
 	mode source.ParseMode
 }
 
-type parseGoHandle struct {
-	handle *memoize.Handle
-	file   source.FileHandle
-	mode   source.ParseMode
-}
+// ParseGo parses the file whose contents are provided by fh, using a cache.
+// The resulting tree may have be fixed up.
+//
+// The parser mode must not be ParseExported: that mode is used during
+// type checking to destructively trim the tree to reduce work,
+// which is not safe for values from a shared cache.
+// TODO(adonovan): opt: shouldn't parseGoImpl do the trimming?
+// Then we can cache the result since it would never change.
+func (s *snapshot) ParseGo(ctx context.Context, fh source.FileHandle, mode source.ParseMode) (*source.ParsedGoFile, error) {
+	if mode == source.ParseExported {
+		panic("only type checking should use Exported")
+	}
 
-type parseGoData struct {
-	parsed *source.ParsedGoFile
-
-	// If true, we adjusted the AST to make it type check better, and
-	// it may not match the source code.
-	fixed bool
-	err   error // any other errors
-}
-
-func (s *snapshot) parseGoHandle(ctx context.Context, fh source.FileHandle, mode source.ParseMode) *parseGoHandle {
 	key := parseKey{
 		file: fh.FileIdentity(),
 		mode: mode,
 	}
-	if pgh := s.getGoFile(key); pgh != nil {
-		return pgh
-	}
-	parseHandle := s.generation.Bind(key, func(ctx context.Context, arg memoize.Arg) interface{} {
-		snapshot := arg.(*snapshot)
-		return parseGo(ctx, snapshot.FileSet(), fh, mode)
-	}, nil)
 
-	pgh := &parseGoHandle{
-		handle: parseHandle,
-		file:   fh,
-		mode:   mode,
-	}
-	return s.addGoFile(key, pgh)
-}
+	s.mu.Lock()
+	entry, hit := s.parsedGoFiles.Get(key)
+	s.mu.Unlock()
 
-func (pgh *parseGoHandle) String() string {
-	return pgh.File().URI().Filename()
-}
+	// cache miss?
+	if !hit {
+		handle, release := s.store.Promise(key, func(ctx context.Context, arg interface{}) interface{} {
+			parsed, err := parseGoImpl(ctx, arg.(*snapshot).FileSet(), fh, mode)
+			return parseGoResult{parsed, err}
+		})
 
-func (pgh *parseGoHandle) File() source.FileHandle {
-	return pgh.file
-}
-
-func (pgh *parseGoHandle) Mode() source.ParseMode {
-	return pgh.mode
-}
-
-func (s *snapshot) ParseGo(ctx context.Context, fh source.FileHandle, mode source.ParseMode) (*source.ParsedGoFile, error) {
-	pgh := s.parseGoHandle(ctx, fh, mode)
-	pgf, _, err := s.parseGo(ctx, pgh)
-	return pgf, err
-}
-
-func (s *snapshot) parseGo(ctx context.Context, pgh *parseGoHandle) (*source.ParsedGoFile, bool, error) {
-	if pgh.mode == source.ParseExported {
-		panic("only type checking should use Exported")
-	}
-	d, err := pgh.handle.Get(ctx, s.generation, s)
-	if err != nil {
-		return nil, false, err
-	}
-	data := d.(*parseGoData)
-	return data.parsed, data.fixed, data.err
-}
-
-type astCacheKey struct {
-	pkg packageHandleKey
-	uri span.URI
-}
-
-func (s *snapshot) astCacheData(ctx context.Context, spkg source.Package, pos token.Pos) (*astCacheData, error) {
-	pkg := spkg.(*pkg)
-	pkgHandle := s.getPackage(pkg.m.ID, pkg.mode)
-	if pkgHandle == nil {
-		return nil, fmt.Errorf("could not reconstruct package handle for %v", pkg.m.ID)
-	}
-	tok := s.FileSet().File(pos)
-	if tok == nil {
-		return nil, fmt.Errorf("no file for pos %v", pos)
-	}
-	pgf, err := pkg.File(span.URIFromPath(tok.Name()))
-	if err != nil {
-		return nil, err
-	}
-	astHandle := s.generation.Bind(astCacheKey{pkgHandle.key, pgf.URI}, func(ctx context.Context, arg memoize.Arg) interface{} {
-		return buildASTCache(pgf)
-	}, nil)
-
-	d, err := astHandle.Get(ctx, s.generation, s)
-	if err != nil {
-		return nil, err
-	}
-	data := d.(*astCacheData)
-	if data.err != nil {
-		return nil, data.err
-	}
-	return data, nil
-}
-
-func (s *snapshot) PosToDecl(ctx context.Context, spkg source.Package, pos token.Pos) (ast.Decl, error) {
-	data, err := s.astCacheData(ctx, spkg, pos)
-	if err != nil {
-		return nil, err
-	}
-	return data.posToDecl[pos], nil
-}
-
-func (s *snapshot) PosToField(ctx context.Context, spkg source.Package, pos token.Pos) (*ast.Field, error) {
-	data, err := s.astCacheData(ctx, spkg, pos)
-	if err != nil {
-		return nil, err
-	}
-	return data.posToField[pos], nil
-}
-
-type astCacheData struct {
-	err error
-
-	posToDecl  map[token.Pos]ast.Decl
-	posToField map[token.Pos]*ast.Field
-}
-
-// buildASTCache builds caches to aid in quickly going from the typed
-// world to the syntactic world.
-func buildASTCache(pgf *source.ParsedGoFile) *astCacheData {
-	var (
-		// path contains all ancestors, including n.
-		path []ast.Node
-		// decls contains all ancestors that are decls.
-		decls []ast.Decl
-	)
-
-	data := &astCacheData{
-		posToDecl:  make(map[token.Pos]ast.Decl),
-		posToField: make(map[token.Pos]*ast.Field),
-	}
-
-	ast.Inspect(pgf.File, func(n ast.Node) bool {
-		if n == nil {
-			lastP := path[len(path)-1]
-			path = path[:len(path)-1]
-			if len(decls) > 0 && decls[len(decls)-1] == lastP {
-				decls = decls[:len(decls)-1]
-			}
-			return false
+		s.mu.Lock()
+		// Check cache again in case another thread got there first.
+		if prev, ok := s.parsedGoFiles.Get(key); ok {
+			entry = prev
+			release()
+		} else {
+			entry = handle
+			s.parsedGoFiles.Set(key, entry, func(_, _ interface{}) { release() })
 		}
+		s.mu.Unlock()
+	}
 
-		path = append(path, n)
-
-		switch n := n.(type) {
-		case *ast.Field:
-			addField := func(f ast.Node) {
-				if f.Pos().IsValid() {
-					data.posToField[f.Pos()] = n
-					if len(decls) > 0 {
-						data.posToDecl[f.Pos()] = decls[len(decls)-1]
-					}
-				}
-			}
-
-			// Add mapping for *ast.Field itself. This handles embedded
-			// fields which have no associated *ast.Ident name.
-			addField(n)
-
-			// Add mapping for each field name since you can have
-			// multiple names for the same type expression.
-			for _, name := range n.Names {
-				addField(name)
-			}
-
-			// Also map "X" in "...X" to the containing *ast.Field. This
-			// makes it easy to format variadic signature params
-			// properly.
-			if elips, ok := n.Type.(*ast.Ellipsis); ok && elips.Elt != nil {
-				addField(elips.Elt)
-			}
-		case *ast.FuncDecl:
-			decls = append(decls, n)
-
-			if n.Name != nil && n.Name.Pos().IsValid() {
-				data.posToDecl[n.Name.Pos()] = n
-			}
-		case *ast.GenDecl:
-			decls = append(decls, n)
-
-			for _, spec := range n.Specs {
-				switch spec := spec.(type) {
-				case *ast.TypeSpec:
-					if spec.Name != nil && spec.Name.Pos().IsValid() {
-						data.posToDecl[spec.Name.Pos()] = n
-					}
-				case *ast.ValueSpec:
-					for _, id := range spec.Names {
-						if id != nil && id.Pos().IsValid() {
-							data.posToDecl[id.Pos()] = n
-						}
-					}
-				}
-			}
-		}
-
-		return true
-	})
-
-	return data
+	// Await result.
+	v, err := s.awaitPromise(ctx, entry.(*memoize.Promise))
+	if err != nil {
+		return nil, err
+	}
+	res := v.(parseGoResult)
+	return res.parsed, res.err
 }
 
-func parseGo(ctx context.Context, fset *token.FileSet, fh source.FileHandle, mode source.ParseMode) *parseGoData {
+// peekParseGoLocked peeks at the cache used by ParseGo but does not
+// populate it or wait for other threads to do so. On cache hit, it returns
+// the cache result of parseGoImpl; otherwise it returns (nil, nil).
+func (s *snapshot) peekParseGoLocked(fh source.FileHandle, mode source.ParseMode) (*source.ParsedGoFile, error) {
+	entry, hit := s.parsedGoFiles.Get(parseKey{fh.FileIdentity(), mode})
+	if !hit {
+		return nil, nil // no-one has requested this file
+	}
+	v := entry.(*memoize.Promise).Cached()
+	if v == nil {
+		return nil, nil // parsing is still in progress
+	}
+	res := v.(parseGoResult)
+	return res.parsed, res.err
+}
+
+// parseGoResult holds the result of a call to parseGoImpl.
+type parseGoResult struct {
+	parsed *source.ParsedGoFile
+	err    error
+}
+
+// parseGoImpl parses the Go source file whose content is provided by fh.
+func parseGoImpl(ctx context.Context, fset *token.FileSet, fh source.FileHandle, mode source.ParseMode) (*source.ParsedGoFile, error) {
 	ctx, done := event.Start(ctx, "cache.parseGo", tag.File.Of(fh.URI().Filename()))
 	defer done()
 
-	if fh.Kind() != source.Go {
-		return &parseGoData{err: errors.Errorf("cannot parse non-Go file %s", fh.URI())}
+	ext := filepath.Ext(fh.URI().Filename())
+	if ext != ".go" && ext != "" { // files generated by cgo have no extension
+		return nil, fmt.Errorf("cannot parse non-Go file %s", fh.URI())
 	}
 	src, err := fh.Read()
 	if err != nil {
-		return &parseGoData{err: err}
+		return nil, err
 	}
 
 	parserMode := parser.AllErrors | parser.ParseComments
@@ -268,7 +134,7 @@ func parseGo(ctx context.Context, fset *token.FileSet, fh source.FileHandle, mod
 
 	tok := fset.File(file.Pos())
 	if tok == nil {
-		// file.Pos is the location of the package declaration. If there was
+		// file.Pos is the location of the package declaration (issue #53202). If there was
 		// none, we can't find the token.File that ParseFile created, and we
 		// have no choice but to recreate it.
 		tok = fset.AddFile(fh.URI().Filename(), -1, len(src))
@@ -313,22 +179,20 @@ func parseGo(ctx context.Context, fset *token.FileSet, fh source.FileHandle, mod
 		}
 	}
 
-	return &parseGoData{
-		parsed: &source.ParsedGoFile{
-			URI:  fh.URI(),
-			Mode: mode,
-			Src:  src,
-			File: file,
-			Tok:  tok,
-			Mapper: &protocol.ColumnMapper{
-				URI:       fh.URI(),
-				Converter: span.NewTokenConverter(fset, tok),
-				Content:   src,
-			},
-			ParseErr: parseErr,
+	return &source.ParsedGoFile{
+		URI:   fh.URI(),
+		Mode:  mode,
+		Src:   src,
+		Fixed: fixed,
+		File:  file,
+		Tok:   tok,
+		Mapper: &protocol.ColumnMapper{
+			URI:     fh.URI(),
+			TokFile: tok,
+			Content: src,
 		},
-		fixed: fixed,
-	}
+		ParseErr: parseErr,
+	}, nil
 }
 
 // An unexportedFilter removes as much unexported AST from a set of Files as possible.
@@ -415,6 +279,8 @@ func (f *unexportedFilter) filterSpec(spec ast.Spec) bool {
 		}
 		switch typ := spec.Type.(type) {
 		case *ast.StructType:
+			// In practice this no longer filters anything;
+			// see comment at StructType case in recordUses.
 			f.filterFieldList(typ.Fields)
 		case *ast.InterfaceType:
 			f.filterFieldList(typ.Methods)
@@ -470,9 +336,19 @@ func (f *unexportedFilter) recordUses(file *ast.File) {
 				case *ast.TypeSpec:
 					switch typ := spec.Type.(type) {
 					case *ast.StructType:
-						f.recordFieldUses(false, typ.Fields)
+						// We used to trim unexported fields but this
+						// had observable consequences. For example,
+						// the 'fieldalignment' analyzer would compute
+						// incorrect diagnostics from the size and
+						// offsets, and the UI hover information for
+						// types was inaccurate. So now we keep them.
+						if typ.Fields != nil {
+							for _, field := range typ.Fields.List {
+								f.recordIdents(field.Type)
+							}
+						}
 					case *ast.InterfaceType:
-						f.recordFieldUses(false, typ.Methods)
+						f.recordInterfaceMethodUses(typ.Methods)
 					}
 				}
 			}
@@ -521,37 +397,32 @@ func (f *unexportedFilter) recordIdents(x ast.Expr) {
 }
 
 // recordFuncType records the types mentioned by a function type.
-func (f *unexportedFilter) recordFuncType(x *ast.FuncType) {
-	f.recordFieldUses(true, x.Params)
-	f.recordFieldUses(true, x.Results)
+func (f *unexportedFilter) recordFuncType(fn *ast.FuncType) {
+	// Parameter and result types of retained functions need to be retained.
+	if fn.Params != nil {
+		for _, field := range fn.Params.List {
+			f.recordIdents(field.Type)
+		}
+	}
+	if fn.Results != nil {
+		for _, field := range fn.Results.List {
+			f.recordIdents(field.Type)
+		}
+	}
 }
 
-// recordFieldUses records unexported identifiers used in fields, which may be
-// struct members, interface members, or function parameter/results.
-func (f *unexportedFilter) recordFieldUses(isParams bool, fields *ast.FieldList) {
-	if fields == nil {
-		return
-	}
-	for _, field := range fields.List {
-		if isParams {
-			// Parameter types of retained functions need to be retained.
-			f.recordIdents(field.Type)
-			continue
-		}
-		if ft, ok := field.Type.(*ast.FuncType); ok {
-			// Function declarations in interfaces need all their types retained.
-			f.recordFuncType(ft)
-			continue
-		}
-		if len(field.Names) == 0 {
-			// Embedded fields might contribute exported names.
-			f.recordIdents(field.Type)
-		}
-		for _, name := range field.Names {
-			// We only need normal fields if they're exported.
-			if ast.IsExported(name.Name) {
-				f.recordIdents(field.Type)
-				break
+// recordInterfaceMethodUses records unexported identifiers used in interface methods.
+func (f *unexportedFilter) recordInterfaceMethodUses(methods *ast.FieldList) {
+	if methods != nil {
+		for _, method := range methods.List {
+			if len(method.Names) == 0 {
+				// I, pkg.I, I[T] -- embedded interface:
+				// may contribute exported names.
+				f.recordIdents(method.Type)
+			} else if ft, ok := method.Type.(*ast.FuncType); ok {
+				// f(T) -- ordinary interface method:
+				// needs all its types retained.
+				f.recordFuncType(ft)
 			}
 		}
 	}
@@ -578,32 +449,35 @@ func (f *unexportedFilter) ProcessErrors(errors []types.Error) (map[string]bool,
 }
 
 // trimAST clears any part of the AST not relevant to type checking
-// expressions at pos.
+// the package-level declarations.
 func trimAST(file *ast.File) {
-	ast.Inspect(file, func(n ast.Node) bool {
-		if n == nil {
-			return false
+	// Eliminate bodies of top-level functions, methods, inits.
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			fn.Body = nil
 		}
+	}
+
+	// Simplify remaining declarations.
+	ast.Inspect(file, func(n ast.Node) bool {
 		switch n := n.(type) {
-		case *ast.FuncDecl:
-			n.Body = nil
-		case *ast.BlockStmt:
-			n.List = nil
-		case *ast.CaseClause:
-			n.Body = nil
-		case *ast.CommClause:
-			n.Body = nil
+		case *ast.FuncLit:
+			// Eliminate bodies of literal functions.
+			// func() { ... } => func() {}
+			n.Body.List = nil
 		case *ast.CompositeLit:
 			// types.Info.Types for long slice/array literals are particularly
-			// expensive. Try to clear them out.
+			// expensive. Try to clear them out: T{e, ..., e} => T{}
 			at, ok := n.Type.(*ast.ArrayType)
 			if !ok {
-				// Composite literal. No harm removing all its fields.
+				// Map or struct literal: no harm removing all its fields.
 				n.Elts = nil
 				break
 			}
+
 			// Removing the elements from an ellipsis array changes its type.
 			// Try to set the length explicitly so we can continue.
+			//  [...]T{e, ..., e} => [3]T[]{}
 			if _, ok := at.Len.(*ast.Ellipsis); ok {
 				length, ok := arrayLength(n)
 				if !ok {
@@ -672,6 +546,9 @@ func arrayLength(array *ast.CompositeLit) (int, bool) {
 
 // fixAST inspects the AST and potentially modifies any *ast.BadStmts so that it can be
 // type-checked more effectively.
+//
+// If fixAST returns true, the resulting AST is considered "fixed", meaning
+// positions have been mangled, and type checker errors may not make sense.
 func fixAST(ctx context.Context, n ast.Node, tok *token.File, src []byte) (fixed bool) {
 	var err error
 	walkASTWithParent(n, func(n, parent ast.Node) bool {
@@ -681,7 +558,7 @@ func fixAST(ctx context.Context, n ast.Node, tok *token.File, src []byte) (fixed
 				// Recursively fix in our fixed node.
 				_ = fixAST(ctx, parent, tok, src)
 			} else {
-				err = errors.Errorf("unable to parse defer or go from *ast.BadStmt: %v", err)
+				err = fmt.Errorf("unable to parse defer or go from *ast.BadStmt: %v", err)
 			}
 			return false
 		case *ast.BadExpr:
@@ -751,7 +628,7 @@ func walkASTWithParent(n ast.Node, f func(n ast.Node, parent ast.Node) bool) {
 
 // fixSrc attempts to modify the file's source code to fix certain
 // syntax errors that leave the rest of the file unparsed.
-func fixSrc(f *ast.File, tok *token.File, src []byte) (newSrc []byte) {
+func fixSrc(f *ast.File, tf *token.File, src []byte) (newSrc []byte) {
 	walkASTWithParent(f, func(n, parent ast.Node) bool {
 		if newSrc != nil {
 			return false
@@ -759,9 +636,9 @@ func fixSrc(f *ast.File, tok *token.File, src []byte) (newSrc []byte) {
 
 		switch n := n.(type) {
 		case *ast.BlockStmt:
-			newSrc = fixMissingCurlies(f, n, parent, tok, src)
+			newSrc = fixMissingCurlies(f, n, parent, tf, src)
 		case *ast.SelectorExpr:
-			newSrc = fixDanglingSelector(n, tok, src)
+			newSrc = fixDanglingSelector(n, tf, src)
 		}
 
 		return newSrc == nil
@@ -773,16 +650,16 @@ func fixSrc(f *ast.File, tok *token.File, src []byte) (newSrc []byte) {
 // fixMissingCurlies adds in curly braces for block statements that
 // are missing curly braces. For example:
 //
-//   if foo
+//	if foo
 //
 // becomes
 //
-//   if foo {}
+//	if foo {}
 func fixMissingCurlies(f *ast.File, b *ast.BlockStmt, parent ast.Node, tok *token.File, src []byte) []byte {
 	// If the "{" is already in the source code, there isn't anything to
 	// fix since we aren't missing curlies.
 	if b.Lbrace.IsValid() {
-		braceOffset, err := source.Offset(tok, b.Lbrace)
+		braceOffset, err := safetoken.Offset(tok, b.Lbrace)
 		if err != nil {
 			return nil
 		}
@@ -837,7 +714,7 @@ func fixMissingCurlies(f *ast.File, b *ast.BlockStmt, parent ast.Node, tok *toke
 
 	var buf bytes.Buffer
 	buf.Grow(len(src) + 3)
-	offset, err := source.Offset(tok, insertPos)
+	offset, err := safetoken.Offset(tok, insertPos)
 	if err != nil {
 		return nil
 	}
@@ -870,23 +747,22 @@ func fixMissingCurlies(f *ast.File, b *ast.BlockStmt, parent ast.Node, tok *toke
 // "case" and "default" keywords as inside the switch statement. For
 // example:
 //
-//   switch {
-//   def<>
-//   }
+//	switch {
+//	def<>
+//	}
 //
 // gets parsed like:
 //
-//   switch {
-//   }
+//	switch {
+//	}
 //
 // Later we manually pull out the "def" token, but we need to detect
 // that our "<>" position is inside the switch block. To do that we
 // move the curly brace so it looks like:
 //
-//   switch {
+//	switch {
 //
-//   }
-//
+//	}
 func fixEmptySwitch(body *ast.BlockStmt, tok *token.File, src []byte) {
 	// We only care about empty switch statements.
 	if len(body.List) > 0 || !body.Rbrace.IsValid() {
@@ -895,7 +771,7 @@ func fixEmptySwitch(body *ast.BlockStmt, tok *token.File, src []byte) {
 
 	// If the right brace is actually in the source code at the
 	// specified position, don't mess with it.
-	braceOffset, err := source.Offset(tok, body.Rbrace)
+	braceOffset, err := safetoken.Offset(tok, body.Rbrace)
 	if err != nil {
 		return
 	}
@@ -916,16 +792,17 @@ func fixEmptySwitch(body *ast.BlockStmt, tok *token.File, src []byte) {
 // fixDanglingSelector inserts real "_" selector expressions in place
 // of phantom "_" selectors. For example:
 //
-// func _() {
-//   x.<>
-// }
+//	func _() {
+//		x.<>
+//	}
+//
 // var x struct { i int }
 //
 // To fix completion at "<>", we insert a real "_" after the "." so the
 // following declaration of "x" can be parsed and type checked
 // normally.
-func fixDanglingSelector(s *ast.SelectorExpr, tok *token.File, src []byte) []byte {
-	if !isPhantomUnderscore(s.Sel, tok, src) {
+func fixDanglingSelector(s *ast.SelectorExpr, tf *token.File, src []byte) []byte {
+	if !isPhantomUnderscore(s.Sel, tf, src) {
 		return nil
 	}
 
@@ -933,7 +810,7 @@ func fixDanglingSelector(s *ast.SelectorExpr, tok *token.File, src []byte) []byt
 		return nil
 	}
 
-	insertOffset, err := source.Offset(tok, s.X.End())
+	insertOffset, err := safetoken.Offset(tf, s.X.End())
 	if err != nil {
 		return nil
 	}
@@ -958,8 +835,10 @@ func fixDanglingSelector(s *ast.SelectorExpr, tok *token.File, src []byte) []byt
 // foo.var
 //
 // yields a "_" selector instead of "var" since "var" is a keyword.
-func fixPhantomSelector(sel *ast.SelectorExpr, tok *token.File, src []byte) {
-	if !isPhantomUnderscore(sel.Sel, tok, src) {
+//
+// TODO(rfindley): should this constitute an ast 'fix'?
+func fixPhantomSelector(sel *ast.SelectorExpr, tf *token.File, src []byte) {
+	if !isPhantomUnderscore(sel.Sel, tf, src) {
 		return
 	}
 
@@ -973,7 +852,7 @@ func fixPhantomSelector(sel *ast.SelectorExpr, tok *token.File, src []byte) {
 		return
 	}
 
-	maybeKeyword := readKeyword(sel.Sel.Pos(), tok, src)
+	maybeKeyword := readKeyword(sel.Sel.Pos(), tf, src)
 	if maybeKeyword == "" {
 		return
 	}
@@ -994,7 +873,7 @@ func isPhantomUnderscore(id *ast.Ident, tok *token.File, src []byte) bool {
 
 	// Phantom underscore means the underscore is not actually in the
 	// program text.
-	offset, err := source.Offset(tok, id.Pos())
+	offset, err := safetoken.Offset(tok, id.Pos())
 	if err != nil {
 		return false
 	}
@@ -1006,17 +885,19 @@ func isPhantomUnderscore(id *ast.Ident, tok *token.File, src []byte) bool {
 // like "if i := 0" the user hasn't typed the semicolon yet so the
 // parser is looking for the conditional expression. However, "i := 0"
 // are not valid expressions, so we get a BadExpr.
+//
+// fixInitStmt returns valid AST for the original source.
 func fixInitStmt(bad *ast.BadExpr, parent ast.Node, tok *token.File, src []byte) {
 	if !bad.Pos().IsValid() || !bad.End().IsValid() {
 		return
 	}
 
 	// Try to extract a statement from the BadExpr.
-	start, err := source.Offset(tok, bad.Pos())
+	start, err := safetoken.Offset(tok, bad.Pos())
 	if err != nil {
 		return
 	}
-	end, err := source.Offset(tok, bad.End()-1)
+	end, err := safetoken.Offset(tok, bad.End()-1)
 	if err != nil {
 		return
 	}
@@ -1060,7 +941,7 @@ func fixInitStmt(bad *ast.BadExpr, parent ast.Node, tok *token.File, src []byte)
 // readKeyword reads the keyword starting at pos, if any.
 func readKeyword(pos token.Pos, tok *token.File, src []byte) string {
 	var kwBytes []byte
-	offset, err := source.Offset(tok, pos)
+	offset, err := safetoken.Offset(tok, pos)
 	if err != nil {
 		return ""
 	}
@@ -1101,11 +982,11 @@ func fixArrayType(bad *ast.BadExpr, parent ast.Node, tok *token.File, src []byte
 	// Avoid doing tok.Offset(to) since that panics if badExpr ends at EOF.
 	// It also panics if the position is not in the range of the file, and
 	// badExprs may not necessarily have good positions, so check first.
-	fromOffset, err := source.Offset(tok, from)
+	fromOffset, err := safetoken.Offset(tok, from)
 	if err != nil {
 		return false
 	}
-	toOffset, err := source.Offset(tok, to-1)
+	toOffset, err := safetoken.Offset(tok, to-1)
 	if err != nil {
 		return false
 	}
@@ -1262,7 +1143,7 @@ FindTo:
 		}
 	}
 
-	fromOffset, err := source.Offset(tok, from)
+	fromOffset, err := safetoken.Offset(tok, from)
 	if err != nil {
 		return false
 	}
@@ -1270,7 +1151,7 @@ FindTo:
 		return false
 	}
 
-	toOffset, err := source.Offset(tok, to)
+	toOffset, err := safetoken.Offset(tok, to)
 	if err != nil {
 		return false
 	}
@@ -1330,17 +1211,17 @@ func parseStmt(pos token.Pos, src []byte) (ast.Stmt, error) {
 	// best-effort behavior, whereas ParseExpr fails hard on any error.
 	fakeFile, err := parser.ParseFile(token.NewFileSet(), "", fileSrc, 0)
 	if fakeFile == nil {
-		return nil, errors.Errorf("error reading fake file source: %v", err)
+		return nil, fmt.Errorf("error reading fake file source: %v", err)
 	}
 
 	// Extract our expression node from inside the fake file.
 	if len(fakeFile.Decls) == 0 {
-		return nil, errors.Errorf("error parsing fake file: %v", err)
+		return nil, fmt.Errorf("error parsing fake file: %v", err)
 	}
 
 	fakeDecl, _ := fakeFile.Decls[0].(*ast.FuncDecl)
 	if fakeDecl == nil || len(fakeDecl.Body.List) == 0 {
-		return nil, errors.Errorf("no statement in %s: %v", src, err)
+		return nil, fmt.Errorf("no statement in %s: %v", src, err)
 	}
 
 	stmt := fakeDecl.Body.List[0]
@@ -1362,7 +1243,7 @@ func parseExpr(pos token.Pos, src []byte) (ast.Expr, error) {
 
 	exprStmt, ok := stmt.(*ast.ExprStmt)
 	if !ok {
-		return nil, errors.Errorf("no expr in %s: %v", src, err)
+		return nil, fmt.Errorf("no expr in %s: %v", src, err)
 	}
 
 	return exprStmt.X, nil
@@ -1388,6 +1269,11 @@ func offsetPositions(n ast.Node, offset token.Pos) {
 				}
 
 				if !f.CanSet() {
+					continue
+				}
+
+				// Don't offset invalid positions: they should stay invalid.
+				if !token.Pos(f.Int()).IsValid() {
 					continue
 				}
 

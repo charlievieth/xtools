@@ -7,6 +7,7 @@ package lsp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -19,10 +20,10 @@ import (
 
 	"github.com/charlievieth/xtools/event"
 	"github.com/charlievieth/xtools/lsp/protocol"
+	"github.com/charlievieth/xtools/lsp/safetoken"
 	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/lsp/template"
 	"github.com/charlievieth/xtools/typeparams"
-	errors "golang.org/x/xerrors"
 )
 
 // The LSP says that errors for the semantic token requests should only be returned
@@ -42,7 +43,7 @@ func (s *Server) semanticTokensFull(ctx context.Context, p *protocol.SemanticTok
 }
 
 func (s *Server) semanticTokensFullDelta(ctx context.Context, p *protocol.SemanticTokensDeltaParams) (interface{}, error) {
-	return nil, errors.Errorf("implement SemanticTokensFullDelta")
+	return nil, fmt.Errorf("implement SemanticTokensFullDelta")
 }
 
 func (s *Server) semanticTokensRange(ctx context.Context, p *protocol.SemanticTokensRangeParams) (*protocol.SemanticTokens, error) {
@@ -52,7 +53,7 @@ func (s *Server) semanticTokensRange(ctx context.Context, p *protocol.SemanticTo
 
 func (s *Server) semanticTokensRefresh(ctx context.Context) error {
 	// in the code, but not in the protocol spec
-	return errors.Errorf("implement SemanticTokensRefresh")
+	return fmt.Errorf("implement SemanticTokensRefresh")
 }
 
 func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocumentIdentifier, rng *protocol.Range) (*protocol.SemanticTokens, error) {
@@ -68,9 +69,10 @@ func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocu
 	if !vv.Options().SemanticTokens {
 		// return an error, so if the option changes
 		// the client won't remember the wrong answer
-		return nil, errors.Errorf("semantictokens are disabled")
+		return nil, fmt.Errorf("semantictokens are disabled")
 	}
-	if fh.Kind() == source.Tmpl {
+	kind := snapshot.View().FileKind(fh)
+	if kind == source.Tmpl {
 		// this is a little cumbersome to avoid both exporting 'encoded' and its methods
 		// and to avoid import cycles
 		e := &encoded{
@@ -87,7 +89,7 @@ func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocu
 		}
 		return template.SemanticTokens(ctx, snapshot, fh.URI(), add, data)
 	}
-	if fh.Kind() != source.Go {
+	if kind != source.Go {
 		return nil, nil
 	}
 	pkg, err := snapshot.PackageForFile(ctx, fh.URI(), source.TypecheckFull, source.WidestPackage)
@@ -105,14 +107,16 @@ func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocu
 		return nil, err
 	}
 	e := &encoded{
-		ctx:      ctx,
-		pgf:      pgf,
-		rng:      rng,
-		ti:       pkg.GetTypesInfo(),
-		pkg:      pkg,
-		fset:     snapshot.FileSet(),
-		tokTypes: s.session.Options().SemanticTypes,
-		tokMods:  s.session.Options().SemanticMods,
+		ctx:       ctx,
+		pgf:       pgf,
+		rng:       rng,
+		ti:        pkg.GetTypesInfo(),
+		pkg:       pkg,
+		fset:      snapshot.FileSet(),
+		tokTypes:  s.session.Options().SemanticTypes,
+		tokMods:   s.session.Options().SemanticMods,
+		noStrings: vv.Options().NoSemanticString,
+		noNumbers: vv.Options().NoSemanticNumber,
 	}
 	if err := e.init(); err != nil {
 		// e.init should never return an error, unless there's some
@@ -184,7 +188,7 @@ func (e *encoded) token(start token.Pos, leng int, typ tokenType, mods []string)
 	}
 	// want a line and column from start (in LSP coordinates)
 	// [//line directives should be ignored]
-	rng := source.NewMappedRange(e.fset, e.pgf.Mapper, start, start+token.Pos(leng))
+	rng := source.NewMappedRange(e.pgf.Tok, e.pgf.Mapper, start, start+token.Pos(leng))
 	lspRange, err := rng.Range()
 	if err != nil {
 		// possibly a //line directive. TODO(pjw): fix this somehow
@@ -221,12 +225,14 @@ type encoded struct {
 	// the generated data
 	items []semItem
 
+	noStrings bool
+	noNumbers bool
+
 	ctx               context.Context
 	tokTypes, tokMods []string
 	pgf               *source.ParsedGoFile
 	rng               *protocol.Range
 	ti                *types.Info
-	types             *types.Package
 	pkg               source.Package
 	fset              *token.FileSet
 	// allowed starting and ending token.Pos, set by init
@@ -245,9 +251,9 @@ func (e *encoded) strStack() string {
 	}
 	if len(e.stack) > 0 {
 		loc := e.stack[len(e.stack)-1].Pos()
-		if !source.InRange(e.pgf.Tok, loc) {
+		if !safetoken.InRange(e.pgf.Tok, loc) {
 			msg = append(msg, fmt.Sprintf("invalid position %v for %s", loc, e.pgf.URI))
-		} else if locInRange(e.pgf.Tok, loc) {
+		} else if safetoken.InRange(e.pgf.Tok, loc) {
 			add := e.pgf.Tok.PositionFor(loc, false)
 			nm := filepath.Base(add.Filename)
 			msg = append(msg, fmt.Sprintf("(%s:%d,col:%d)", nm, add.Line, add.Column))
@@ -259,16 +265,11 @@ func (e *encoded) strStack() string {
 	return strings.Join(msg, " ")
 }
 
-// avoid panic in token.PostionFor() when typing at the end of the file
-func locInRange(f *token.File, loc token.Pos) bool {
-	return f.Base() <= int(loc) && int(loc) < f.Base()+f.Size()
-}
-
 // find the line in the source
 func (e *encoded) srcLine(x ast.Node) string {
 	file := e.pgf.Tok
 	line := file.Line(x.Pos())
-	start, err := source.Offset(file, file.LineStart(line))
+	start, err := safetoken.Offset(file, file.LineStart(line))
 	if err != nil {
 		return ""
 	}
@@ -303,11 +304,6 @@ func (e *encoded) inspector(n ast.Node) bool {
 		what := tokNumber
 		if x.Kind == token.STRING {
 			what = tokString
-			if _, ok := e.stack[len(e.stack)-2].(*ast.Field); ok {
-				// struct tags (this is probably pointless, as the
-				// TextMate grammar will treat all the other comments the same)
-				what = tokComment
-			}
 		}
 		e.token(x.Pos(), ln, what, nil)
 	case *ast.BinaryExpr:
@@ -328,12 +324,17 @@ func (e *encoded) inspector(n ast.Node) bool {
 		e.token(x.Case, len(iam), tokKeyword, nil)
 	case *ast.ChanType:
 		// chan | chan <- | <- chan
-		if x.Arrow == token.NoPos || x.Arrow != x.Begin {
+		switch {
+		case x.Arrow == token.NoPos:
 			e.token(x.Begin, len("chan"), tokKeyword, nil)
-			break
+		case x.Arrow == x.Begin:
+			e.token(x.Arrow, 2, tokOperator, nil)
+			pos := e.findKeyword("chan", x.Begin+2, x.Value.Pos())
+			e.token(pos, len("chan"), tokKeyword, nil)
+		case x.Arrow != x.Begin:
+			e.token(x.Begin, len("chan"), tokKeyword, nil)
+			e.token(x.Arrow, 2, tokOperator, nil)
 		}
-		pos := e.findKeyword("chan", x.Begin+2, x.Value.Pos())
-		e.token(pos, len("chan"), tokKeyword, nil)
 	case *ast.CommClause:
 		iam := len("case")
 		if x.Comm == nil {
@@ -378,7 +379,7 @@ func (e *encoded) inspector(n ast.Node) bool {
 	case *ast.IncDecStmt:
 		e.token(x.TokPos, len(x.Tok.String()), tokOperator, nil)
 	case *ast.IndexExpr:
-	case *typeparams.IndexListExpr: // accomodate generics
+	case *typeparams.IndexListExpr: // accommodate generics
 	case *ast.InterfaceType:
 		e.token(x.Interface, len("interface"), tokKeyword, nil)
 	case *ast.KeyValueExpr:
@@ -809,7 +810,7 @@ func (e *encoded) init() error {
 	}
 	span, err := e.pgf.Mapper.RangeSpan(*e.rng)
 	if err != nil {
-		return errors.Errorf("range span (%w) error for %s", err, e.pgf.File.Name)
+		return fmt.Errorf("range span (%w) error for %s", err, e.pgf.File.Name)
 	}
 	e.end = e.start + token.Pos(span.End().Offset())
 	e.start += token.Pos(span.Start().Offset())
@@ -829,29 +830,38 @@ func (e *encoded) Data() []uint32 {
 	// (see Integer Encoding for Tokens in the LSP spec)
 	x := make([]uint32, 5*len(e.items))
 	var j int
+	var last semItem
 	for i := 0; i < len(e.items); i++ {
-		typ, ok := typeMap[e.items[i].typeStr]
+		item := e.items[i]
+		typ, ok := typeMap[item.typeStr]
 		if !ok {
 			continue // client doesn't want typeStr
 		}
-		if i == 0 {
+		if item.typeStr == tokString && e.noStrings {
+			continue
+		}
+		if item.typeStr == tokNumber && e.noNumbers {
+			continue
+		}
+		if j == 0 {
 			x[0] = e.items[0].line
 		} else {
-			x[j] = e.items[i].line - e.items[i-1].line
+			x[j] = item.line - last.line
 		}
-		x[j+1] = e.items[i].start
-		if i > 0 && e.items[i].line == e.items[i-1].line {
-			x[j+1] = e.items[i].start - e.items[i-1].start
+		x[j+1] = item.start
+		if j > 0 && x[j] == 0 {
+			x[j+1] = item.start - last.start
 		}
-		x[j+2] = e.items[i].len
+		x[j+2] = item.len
 		x[j+3] = uint32(typ)
 		mask := 0
-		for _, s := range e.items[i].mods {
+		for _, s := range item.mods {
 			// modMap[s] is 0 if the client doesn't want this modifier
 			mask |= modMap[s]
 		}
 		x[j+4] = uint32(mask)
 		j += 5
+		last = item
 	}
 	return x[:j]
 }

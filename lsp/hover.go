@@ -11,6 +11,7 @@ import (
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/lsp/template"
+	"github.com/charlievieth/xtools/lsp/work"
 )
 
 func (s *Server) hover(ctx context.Context, params *protocol.HoverParams) (*protocol.Hover, error) {
@@ -19,13 +20,15 @@ func (s *Server) hover(ctx context.Context, params *protocol.HoverParams) (*prot
 	if !ok {
 		return nil, err
 	}
-	switch fh.Kind() {
+	switch snapshot.View().FileKind(fh) {
 	case source.Mod:
 		return mod.Hover(ctx, snapshot, fh, params.Position)
 	case source.Go:
 		return source.Hover(ctx, snapshot, fh, params.Position)
 	case source.Tmpl:
 		return template.Hover(ctx, snapshot, fh, params.Position)
+	case source.Work:
+		return work.Hover(ctx, snapshot, fh, params.Position)
 	}
 	return nil, nil
 }
