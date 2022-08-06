@@ -6,10 +6,12 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 
+	"golang.org/x/mod/modfile"
 	"github.com/charlievieth/xtools/lsp/fake"
 	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/span"
@@ -296,16 +298,85 @@ replace gopls.test => ../../gopls.test2`, false},
 						t.Fatal(err)
 					}
 				}
-				got, gotChanged, gotReload := w.invalidate(ctx, changes, fs)
+				got, gotReinit := w.Clone(ctx, changes, fs)
+				gotChanged := got != w
 				if gotChanged != test.wantChanged {
 					t.Errorf("w.invalidate(): got changed %t, want %t", gotChanged, test.wantChanged)
 				}
-				if gotReload != test.wantReload {
-					t.Errorf("w.invalidate(): got reload %t, want %t", gotReload, test.wantReload)
+				if gotReinit != test.wantReload {
+					t.Errorf("w.invalidate(): got reload %t, want %t", gotReinit, test.wantReload)
 				}
 				checkState(ctx, t, fs, rel, got, test.finalState)
 			}
 		})
+	}
+}
+
+func workspaceFromTxtar(t *testing.T, files string) (*workspace, func(), error) {
+	ctx := context.Background()
+	dir, err := fake.Tempdir(fake.UnpackTxt(files))
+	if err != nil {
+		return nil, func() {}, err
+	}
+	cleanup := func() {
+		os.RemoveAll(dir)
+	}
+	root := span.URIFromPath(dir)
+
+	fs := &osFileSource{}
+	excludeNothing := func(string) bool { return false }
+	workspace, err := newWorkspace(ctx, root, fs, excludeNothing, false, false)
+	return workspace, cleanup, err
+}
+
+func TestWorkspaceParseError(t *testing.T) {
+	w, cleanup, err := workspaceFromTxtar(t, `
+-- go.work --
+go 1.18
+
+usa ./typo
+-- typo/go.mod --
+module foo
+`)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("error creating workspace: %v; want no error", err)
+	}
+	w.buildMu.Lock()
+	built, buildErr := w.built, w.buildErr
+	w.buildMu.Unlock()
+	if !built || buildErr == nil {
+		t.Fatalf("built, buildErr: got %v, %v; want true, non-nil", built, buildErr)
+	}
+	var errList modfile.ErrorList
+	if !errors.As(buildErr, &errList) {
+		t.Fatalf("expected error to be an errorlist; got %v", buildErr)
+	}
+	if len(errList) != 1 {
+		t.Fatalf("expected errorList to have one element; got %v elements", len(errList))
+	}
+	parseErr := errList[0]
+	if parseErr.Pos.Line != 3 {
+		t.Fatalf("expected error to be on line 3; got %v", parseErr.Pos.Line)
+	}
+}
+
+func TestWorkspaceMissingModFile(t *testing.T) {
+	w, cleanup, err := workspaceFromTxtar(t, `
+-- go.work --
+go 1.18
+
+use ./missing
+`)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("error creating workspace: %v; want no error", err)
+	}
+	w.buildMu.Lock()
+	built, buildErr := w.built, w.buildErr
+	w.buildMu.Unlock()
+	if !built || buildErr == nil {
+		t.Fatalf("built, buildErr: got %v, %v; want true, non-nil", built, buildErr)
 	}
 }
 

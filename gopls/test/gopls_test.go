@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/charlievieth/xtools/gopls/hooks"
+	"github.com/charlievieth/xtools/lsp/bug"
 	cmdtest "github.com/charlievieth/xtools/lsp/cmd/test"
 	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/lsp/tests"
@@ -19,6 +20,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	bug.PanicOnBugs = true
 	testenv.ExitIfSmallMachine()
 	os.Exit(m.Run())
 }

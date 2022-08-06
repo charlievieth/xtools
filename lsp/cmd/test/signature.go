@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/charlievieth/xtools/lsp/protocol"
+	"github.com/charlievieth/xtools/lsp/tests"
 	"github.com/charlievieth/xtools/span"
 )
 
@@ -27,7 +28,7 @@ func (r *runner) SignatureHelp(t *testing.T, spn span.Span, want *protocol.Signa
 	expect := string(r.data.Golden(goldenTag, filename, func() ([]byte, error) {
 		return []byte(got), nil
 	}))
-	if expect != got {
+	if tests.NormalizeAny(expect) != tests.NormalizeAny(got) {
 		t.Errorf("signature failed for %s expected:\n%q\ngot:\n%q'", filename, expect, got)
 	}
 }

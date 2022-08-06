@@ -6,6 +6,7 @@ package source_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charlievieth/xtools/lsp/bug"
 	"github.com/charlievieth/xtools/lsp/cache"
 	"github.com/charlievieth/xtools/lsp/diff"
 	"github.com/charlievieth/xtools/lsp/diff/myers"
@@ -24,10 +26,10 @@ import (
 	"github.com/charlievieth/xtools/lsp/tests"
 	"github.com/charlievieth/xtools/span"
 	"github.com/charlievieth/xtools/testenv"
-	errors "golang.org/x/xerrors"
 )
 
 func TestMain(m *testing.M) {
+	bug.PanicOnBugs = true
 	testenv.ExitIfSmallMachine()
 	os.Exit(m.Run())
 }
@@ -47,16 +49,16 @@ type runner struct {
 func testSource(t *testing.T, datum *tests.Data) {
 	ctx := tests.Context(t)
 
-	cache := cache.New(nil)
+	cache := cache.New(nil, nil, nil)
 	session := cache.NewSession(ctx)
 	options := source.DefaultOptions().Clone()
 	tests.DefaultOptions(options)
 	options.SetEnvSlice(datum.Config.Env)
-	view, _, release, err := session.NewView(ctx, "source_test", span.URIFromPath(datum.Config.Dir), "", options)
-	release()
+	view, _, release, err := session.NewView(ctx, "source_test", span.URIFromPath(datum.Config.Dir), options)
 	if err != nil {
 		t.Fatal(err)
 	}
+	release()
 	defer view.Shutdown(ctx)
 
 	// Enable type error analyses for tests.
@@ -66,8 +68,7 @@ func testSource(t *testing.T, datum *tests.Data) {
 
 	var modifications []source.FileModification
 	for filename, content := range datum.Config.Overlay {
-		kind := source.DetectLanguage("", filename)
-		if kind != source.Go {
+		if filepath.Ext(filename) != ".go" {
 			continue
 		}
 		modifications = append(modifications, source.FileModification{
@@ -684,6 +685,10 @@ func (r *runner) Highlight(t *testing.T, src span.Span, locations []span.Span) {
 	}
 }
 
+func (r *runner) InlayHints(t *testing.T, src span.Span) {
+	// TODO(golang/go#53315): add source test
+}
+
 func (r *runner) Hover(t *testing.T, src span.Span, text string) {
 	ctx := r.ctx
 	_, srcRng, err := spanToRange(r.data, src)
@@ -963,14 +968,12 @@ func (r *runner) SignatureHelp(t *testing.T, spn span.Span, want *protocol.Signa
 }
 
 // These are pure LSP features, no source level functionality to be tested.
-func (r *runner) Link(t *testing.T, uri span.URI, wantLinks []tests.Link) {}
-
-func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string, expectedActions int) {
-}
-func (r *runner) FunctionExtraction(t *testing.T, start span.Span, end span.Span) {}
-func (r *runner) MethodExtraction(t *testing.T, start span.Span, end span.Span)   {}
-func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens)   {}
-func (r *runner) AddImport(t *testing.T, uri span.URI, expectedImport string)     {}
+func (r *runner) Link(t *testing.T, uri span.URI, wantLinks []tests.Link)                          {}
+func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actions []tests.SuggestedFix, want int) {}
+func (r *runner) FunctionExtraction(t *testing.T, start span.Span, end span.Span)                  {}
+func (r *runner) MethodExtraction(t *testing.T, start span.Span, end span.Span)                    {}
+func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens)                    {}
+func (r *runner) AddImport(t *testing.T, uri span.URI, expectedImport string)                      {}
 
 func spanToRange(data *tests.Data, spn span.Span) (*protocol.ColumnMapper, protocol.Range, error) {
 	m, err := data.Mapper(spn.URI())

@@ -18,10 +18,13 @@ import (
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ast/astutil"
 	"github.com/charlievieth/xtools/analysisinternal"
+	"github.com/charlievieth/xtools/lsp/bug"
+	"github.com/charlievieth/xtools/lsp/safetoken"
 	"github.com/charlievieth/xtools/span"
 )
 
 func extractVariable(fset *token.FileSet, rng span.Range, src []byte, file *ast.File, _ *types.Package, info *types.Info) (*analysis.SuggestedFix, error) {
+	tokFile := fset.File(file.Pos())
 	expr, path, ok, err := CanExtractVariable(rng, file)
 	if !ok {
 		return nil, fmt.Errorf("extractVariable: cannot extract %s: %v", fset.Position(rng.Start), err)
@@ -59,11 +62,7 @@ func extractVariable(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 	if insertBeforeStmt == nil {
 		return nil, fmt.Errorf("cannot find location to insert extraction")
 	}
-	tok := fset.File(expr.Pos())
-	if tok == nil {
-		return nil, fmt.Errorf("no file for pos %v", fset.Position(file.Pos()))
-	}
-	indent, err := calculateIndentation(src, tok, insertBeforeStmt)
+	indent, err := calculateIndentation(src, tokFile, insertBeforeStmt)
 	if err != nil {
 		return nil, err
 	}
@@ -134,18 +133,18 @@ func CanExtractVariable(rng span.Range, file *ast.File) (ast.Expr, []ast.Node, b
 // line of code on which the insertion occurs.
 func calculateIndentation(content []byte, tok *token.File, insertBeforeStmt ast.Node) (string, error) {
 	line := tok.Line(insertBeforeStmt.Pos())
-	lineOffset, err := Offset(tok, tok.LineStart(line))
+	lineOffset, err := safetoken.Offset(tok, tok.LineStart(line))
 	if err != nil {
 		return "", err
 	}
-	stmtOffset, err := Offset(tok, insertBeforeStmt.Pos())
+	stmtOffset, err := safetoken.Offset(tok, insertBeforeStmt.Pos())
 	if err != nil {
 		return "", err
 	}
 	return string(content[lineOffset:stmtOffset]), nil
 }
 
-// generateAvailableIdentifier adjusts the new function name until there are no collisons in scope.
+// generateAvailableIdentifier adjusts the new function name until there are no collisions in scope.
 // Possible collisions include other function and variable names. Returns the next index to check for prefix.
 func generateAvailableIdentifier(pos token.Pos, file *ast.File, path []ast.Node, info *types.Info, prefix string, idx int) (string, int) {
 	scopes := CollectScopes(info, path, pos)
@@ -216,7 +215,12 @@ func extractFunctionMethod(fset *token.FileSet, rng span.Range, src []byte, file
 	if isMethod {
 		errorPrefix = "extractMethod"
 	}
-	p, ok, methodOk, err := CanExtractFunction(fset, rng, src, file)
+
+	tok := fset.File(file.Pos())
+	if tok == nil {
+		return nil, bug.Errorf("no file for position")
+	}
+	p, ok, methodOk, err := CanExtractFunction(tok, rng, src, file)
 	if (!ok && !isMethod) || (!methodOk && isMethod) {
 		return nil, fmt.Errorf("%s: cannot extract %s: %v", errorPrefix,
 			fset.Position(rng.Start), err)
@@ -290,7 +294,7 @@ func extractFunctionMethod(fset *token.FileSet, rng span.Range, src []byte, file
 		uninitialized           []types.Object // vars we will need to initialize before the call
 	)
 
-	// Avoid duplicates while traversing vars and uninitialzed.
+	// Avoid duplicates while traversing vars and uninitialized.
 	seenVars := make(map[types.Object]ast.Expr)
 	seenUninitialized := make(map[types.Object]struct{})
 
@@ -329,7 +333,7 @@ func extractFunctionMethod(fset *token.FileSet, rng span.Range, src []byte, file
 			// The blank identifier is always a local variable
 			continue
 		}
-		typ := analysisinternal.TypeExpr(fset, file, pkg, v.obj.Type())
+		typ := analysisinternal.TypeExpr(file, pkg, v.obj.Type())
 		if typ == nil {
 			return nil, fmt.Errorf("nil AST expression for type: %v", v.obj.Name())
 		}
@@ -343,7 +347,7 @@ func extractFunctionMethod(fset *token.FileSet, rng span.Range, src []byte, file
 		if v.obj.Parent() == nil {
 			return nil, fmt.Errorf("parent nil")
 		}
-		isUsed, firstUseAfter := objUsed(info, span.NewRange(fset, rng.End, v.obj.Parent().End()), v.obj)
+		isUsed, firstUseAfter := objUsed(info, span.NewRange(tok, rng.End, v.obj.Parent().End()), v.obj)
 		if v.assigned && isUsed && !varOverridden(info, firstUseAfter, v.obj, v.free, outer) {
 			returnTypes = append(returnTypes, &ast.Field{Type: typ})
 			returns = append(returns, identifier)
@@ -400,11 +404,11 @@ func extractFunctionMethod(fset *token.FileSet, rng span.Range, src []byte, file
 
 	// We put the selection in a constructed file. We can then traverse and edit
 	// the extracted selection without modifying the original AST.
-	startOffset, err := Offset(tok, rng.Start)
+	startOffset, err := safetoken.Offset(tok, rng.Start)
 	if err != nil {
 		return nil, err
 	}
-	endOffset, err := Offset(tok, rng.End)
+	endOffset, err := safetoken.Offset(tok, rng.End)
 	if err != nil {
 		return nil, err
 	}
@@ -523,7 +527,7 @@ func extractFunctionMethod(fset *token.FileSet, rng span.Range, src []byte, file
 
 	// Construct the appropriate call to the extracted function.
 	// We must meet two conditions to use ":=" instead of '='. (1) there must be at least
-	// one variable on the lhs that is uninitailized (non-free) prior to the assignment.
+	// one variable on the lhs that is uninitialized (non-free) prior to the assignment.
 	// (2) all of the initialized (free) variables on the lhs must be able to be redefined.
 	sym := token.ASSIGN
 	canDefineCount := len(uninitialized) + canRedefineCount
@@ -567,7 +571,7 @@ func extractFunctionMethod(fset *token.FileSet, rng span.Range, src []byte, file
 
 	// Create variable declarations for any identifiers that need to be initialized prior to
 	// calling the extracted function. We do not manually initialize variables if every return
-	// value is unitialized. We can use := to initialize the variables in this situation.
+	// value is uninitialized. We can use := to initialize the variables in this situation.
 	var declarations []ast.Stmt
 	if canDefineCount != len(returns) {
 		declarations = initializeVars(uninitialized, retVars, seenUninitialized, seenVars)
@@ -600,11 +604,11 @@ func extractFunctionMethod(fset *token.FileSet, rng span.Range, src []byte, file
 
 	// We're going to replace the whole enclosing function,
 	// so preserve the text before and after the selected block.
-	outerStart, err := Offset(tok, outer.Pos())
+	outerStart, err := safetoken.Offset(tok, outer.Pos())
 	if err != nil {
 		return nil, err
 	}
-	outerEnd, err := Offset(tok, outer.End())
+	outerEnd, err := safetoken.Offset(tok, outer.End())
 	if err != nil {
 		return nil, err
 	}
@@ -661,7 +665,7 @@ func extractFunctionMethod(fset *token.FileSet, rng span.Range, src []byte, file
 // ranges to match the correct AST node. In this particular example, we would adjust
 // rng.Start forward by one byte, and rng.End backwards by two bytes.
 func adjustRangeForWhitespace(rng span.Range, tok *token.File, content []byte) (span.Range, error) {
-	offset, err := Offset(tok, rng.Start)
+	offset, err := safetoken.Offset(tok, rng.Start)
 	if err != nil {
 		return span.Range{}, err
 	}
@@ -675,7 +679,7 @@ func adjustRangeForWhitespace(rng span.Range, tok *token.File, content []byte) (
 	rng.Start = tok.Pos(offset)
 
 	// Move backwards to find a non-whitespace character.
-	offset, err = Offset(tok, rng.End)
+	offset, err = safetoken.Offset(tok, rng.End)
 	if err != nil {
 		return span.Range{}, err
 	}
@@ -940,13 +944,9 @@ type fnExtractParams struct {
 
 // CanExtractFunction reports whether the code in the given range can be
 // extracted to a function.
-func CanExtractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.File) (*fnExtractParams, bool, bool, error) {
+func CanExtractFunction(tok *token.File, rng span.Range, src []byte, file *ast.File) (*fnExtractParams, bool, bool, error) {
 	if rng.Start == rng.End {
 		return nil, false, false, fmt.Errorf("start and end are equal")
-	}
-	tok := fset.File(file.Pos())
-	if tok == nil {
-		return nil, false, false, fmt.Errorf("no file for pos %v", fset.Position(file.Pos()))
 	}
 	var err error
 	rng, err = adjustRangeForWhitespace(rng, tok, src)
@@ -1129,7 +1129,7 @@ func generateReturnInfo(enclosing *ast.FuncType, pkg *types.Package, path []ast.
 				return nil, nil, fmt.Errorf(
 					"failed type conversion, AST expression: %T", field.Type)
 			}
-			expr := analysisinternal.TypeExpr(fset, file, pkg, typ)
+			expr := analysisinternal.TypeExpr(file, pkg, typ)
 			if expr == nil {
 				return nil, nil, fmt.Errorf("nil AST expression")
 			}
@@ -1137,10 +1137,9 @@ func generateReturnInfo(enclosing *ast.FuncType, pkg *types.Package, path []ast.
 			name, idx = generateAvailableIdentifier(pos, file,
 				path, info, "returnValue", idx)
 			retVars = append(retVars, &returnVariable{
-				name: ast.NewIdent(name),
-				decl: &ast.Field{Type: expr},
-				zeroVal: analysisinternal.ZeroValue(
-					fset, file, pkg, typ),
+				name:    ast.NewIdent(name),
+				decl:    &ast.Field{Type: expr},
+				zeroVal: analysisinternal.ZeroValue(file, pkg, typ),
 			})
 		}
 	}
@@ -1169,7 +1168,7 @@ func adjustReturnStatements(returnTypes []*ast.Field, seenVars map[types.Object]
 			if typ != returnType.Type {
 				continue
 			}
-			val = analysisinternal.ZeroValue(fset, file, pkg, obj.Type())
+			val = analysisinternal.ZeroValue(file, pkg, obj.Type())
 			break
 		}
 		if val == nil {

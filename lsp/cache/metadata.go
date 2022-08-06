@@ -29,10 +29,10 @@ type Metadata struct {
 	Name            PackageName
 	GoFiles         []span.URI
 	CompiledGoFiles []span.URI
-	ForTest         PackagePath
+	ForTest         PackagePath // package path under test, or ""
 	TypesSizes      types.Sizes
 	Errors          []packages.Error
-	Deps            []PackageID
+	Deps            []PackageID // direct dependencies, in string order
 	MissingDeps     map[PackagePath]struct{}
 	Module          *packages.Module
 	depsErrors      []*packagesinternal.PackageError
@@ -43,6 +43,29 @@ type Metadata struct {
 	// IsIntermediateTestVariant reports whether the given package is an
 	// intermediate test variant, e.g.
 	// "github.com/charlievieth/xtools/lsp/cache [github.com/charlievieth/xtools/lsp/source.test]".
+	//
+	// Such test variants arise when an x_test package (in this case source_test)
+	// imports a package (in this case cache) that itself imports the the
+	// non-x_test package (in this case source).
+	//
+	// This is done so that the forward transitive closure of source_test has
+	// only one package for the "github.com/charlievieth/xtools/lsp/source" import.
+	// The intermediate test variant exists to hold the test variant import:
+	//
+	// github.com/charlievieth/xtools/lsp/source_test [github.com/charlievieth/xtools/lsp/source.test]
+	//  | "github.com/charlievieth/xtools/lsp/cache" -> github.com/charlievieth/xtools/lsp/cache [github.com/charlievieth/xtools/lsp/source.test]
+	//  | "github.com/charlievieth/xtools/lsp/source" -> github.com/charlievieth/xtools/lsp/source [github.com/charlievieth/xtools/lsp/source.test]
+	//  | ...
+	//
+	// github.com/charlievieth/xtools/lsp/cache [github.com/charlievieth/xtools/lsp/source.test]
+	//  | "github.com/charlievieth/xtools/lsp/source" -> github.com/charlievieth/xtools/lsp/source [github.com/charlievieth/xtools/lsp/source.test]
+	//  | ...
+	//
+	// We filter these variants out in certain places. For example, there is
+	// generally no reason to run diagnostics or analysis on them.
+	//
+	// TODO(rfindley): this can probably just be a method, since it is derived
+	// from other fields.
 	IsIntermediateTestVariant bool
 }
 
@@ -56,6 +79,11 @@ func (m *Metadata) PackagePath() string {
 	return string(m.PkgPath)
 }
 
+// ModuleInfo implements the source.Metadata interface.
+func (m *Metadata) ModuleInfo() *packages.Module {
+	return m.Module
+}
+
 // KnownMetadata is a wrapper around metadata that tracks its validity.
 type KnownMetadata struct {
 	*Metadata
@@ -63,7 +91,4 @@ type KnownMetadata struct {
 	// Valid is true if the given metadata is Valid.
 	// Invalid metadata can still be used if a metadata reload fails.
 	Valid bool
-
-	// ShouldLoad is true if the given metadata should be reloaded.
-	ShouldLoad bool
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/charlievieth/xtools/lsp/mod"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
+	"github.com/charlievieth/xtools/lsp/work"
 )
 
 func (s *Server) formatting(ctx context.Context, params *protocol.DocumentFormattingParams) ([]protocol.TextEdit, error) {
@@ -18,11 +19,13 @@ func (s *Server) formatting(ctx context.Context, params *protocol.DocumentFormat
 	if !ok {
 		return nil, err
 	}
-	switch fh.Kind() {
+	switch snapshot.View().FileKind(fh) {
 	case source.Mod:
 		return mod.Format(ctx, snapshot, fh)
 	case source.Go:
 		return source.Format(ctx, snapshot, fh)
+	case source.Work:
+		return work.Format(ctx, snapshot, fh)
 	}
 	return nil, nil
 }

@@ -11,9 +11,11 @@ import (
 	"testing"
 
 	"github.com/charlievieth/xtools/gopls/hooks"
+	"github.com/charlievieth/xtools/lsp/bug"
 	"github.com/charlievieth/xtools/lsp/regtest"
 )
 
 func TestMain(m *testing.M) {
+	bug.PanicOnBugs = true
 	regtest.Main(m, hooks.Options)
 }

@@ -7,6 +7,7 @@ package lsp
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,9 +22,9 @@ import (
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
 	"github.com/charlievieth/xtools/lsp/template"
+	"github.com/charlievieth/xtools/lsp/work"
 	"github.com/charlievieth/xtools/span"
 	"github.com/charlievieth/xtools/xcontext"
-	errors "golang.org/x/xerrors"
 )
 
 // diagnosticSource differentiates different sources of diagnostics.
@@ -35,21 +36,47 @@ const (
 	analysisSource
 	typeCheckSource
 	orphanedSource
+	workSource
 )
 
 // A diagnosticReport holds results for a single diagnostic source.
 type diagnosticReport struct {
-	snapshotID    uint64
-	publishedHash string
+	snapshotID    uint64 // snapshot ID on which the report was computed
+	publishedHash string // last published hash for this (URI, source)
 	diags         map[string]*source.Diagnostic
 }
 
 // fileReports holds a collection of diagnostic reports for a single file, as
 // well as the hash of the last published set of diagnostics.
 type fileReports struct {
-	snapshotID    uint64
+	// publishedSnapshotID is the last snapshot ID for which we have "published"
+	// diagnostics (though the publishDiagnostics notification may not have
+	// actually been sent, if nothing changed).
+	//
+	// Specifically, publishedSnapshotID is updated to a later snapshot ID when
+	// we either:
+	//  (1) publish diagnostics for the file for a snapshot, or
+	//  (2) determine that published diagnostics are valid for a new snapshot.
+	//
+	// Notably publishedSnapshotID may not match the snapshot id on individual reports in
+	// the reports map:
+	// - we may have published partial diagnostics from only a subset of
+	//   diagnostic sources for which new results have been computed, or
+	// - we may have started computing reports for an even new snapshot, but not
+	//   yet published.
+	//
+	// This prevents gopls from publishing stale diagnostics.
+	publishedSnapshotID uint64
+
+	// publishedHash is a hash of the latest diagnostics published for the file.
 	publishedHash string
-	reports       map[diagnosticSource]diagnosticReport
+
+	// If set, mustPublish marks diagnostics as needing publication, independent
+	// of whether their publishedHash has changed.
+	mustPublish bool
+
+	// The last stored diagnostics for each diagnostic source.
+	reports map[diagnosticSource]diagnosticReport
 }
 
 func (d diagnosticSource) String() string {
@@ -64,6 +91,8 @@ func (d diagnosticSource) String() string {
 		return "FromTypeChecking"
 	case orphanedSource:
 		return "FromOrphans"
+	case workSource:
+		return "FromGoWork"
 	default:
 		return fmt.Sprintf("From?%d?", d)
 	}
@@ -210,6 +239,23 @@ func (s *Server) diagnose(ctx context.Context, snapshot source.Snapshot, forceAn
 		s.storeDiagnostics(snapshot, id.URI, modSource, diags)
 	}
 
+	// Diagnose the go.work file, if it exists.
+	workReports, workErr := work.Diagnostics(ctx, snapshot)
+	if ctx.Err() != nil {
+		log.Trace.Log(ctx, "diagnose cancelled")
+		return
+	}
+	if workErr != nil {
+		event.Error(ctx, "warning: diagnose go.work", workErr, tag.Directory.Of(snapshot.View().Folder().Filename()), tag.Snapshot.Of(snapshot.ID()))
+	}
+	for id, diags := range workReports {
+		if id.URI == "" {
+			event.Error(ctx, "missing URI for work file diagnostics", fmt.Errorf("empty URI"), tag.Directory.Of(snapshot.View().Folder().Filename()))
+			continue
+		}
+		s.storeDiagnostics(snapshot, id.URI, workSource, diags)
+	}
+
 	// Diagnose all of the packages in the workspace.
 	wsPkgs, err := snapshot.ActivePackages(ctx)
 	if s.shouldIgnoreError(ctx, snapshot, err) {
@@ -288,7 +334,11 @@ func (s *Server) diagnosePkg(ctx context.Context, snapshot source.Snapshot, pkg 
 		return
 	}
 	for _, cgf := range pkg.CompiledGoFiles() {
-		s.storeDiagnostics(snapshot, cgf.URI, typeCheckSource, pkgDiagnostics[cgf.URI])
+		// builtin.go exists only for documentation purposes, and is not valid Go code.
+		// Don't report distracting errors
+		if !snapshot.IsBuiltin(ctx, cgf.URI) {
+			s.storeDiagnostics(snapshot, cgf.URI, typeCheckSource, pkgDiagnostics[cgf.URI])
+		}
 	}
 	if includeAnalysis && !pkg.HasListOrParseErrors() {
 		reports, err := source.Analyze(ctx, snapshot, pkg, false)
@@ -333,6 +383,24 @@ func (s *Server) diagnosePkg(ctx context.Context, snapshot source.Snapshot, pkg 
 	}
 }
 
+// mustPublishDiagnostics marks the uri as needing publication, independent of
+// whether the published contents have changed.
+//
+// This can be used for ensuring gopls publishes diagnostics after certain file
+// events.
+func (s *Server) mustPublishDiagnostics(uri span.URI) {
+	s.diagnosticsMu.Lock()
+	defer s.diagnosticsMu.Unlock()
+
+	if s.diagnostics[uri] == nil {
+		s.diagnostics[uri] = &fileReports{
+			publishedHash: hashDiagnostics(), // Hash for 0 diagnostics.
+			reports:       map[diagnosticSource]diagnosticReport{},
+		}
+	}
+	s.diagnostics[uri].mustPublish = true
+}
+
 // storeDiagnostics stores results from a single diagnostic source. If merge is
 // true, it merges results into any existing results for this snapshot.
 func (s *Server) storeDiagnostics(snapshot source.Snapshot, uri span.URI, dsource diagnosticSource, diags []*source.Diagnostic) {
@@ -342,6 +410,7 @@ func (s *Server) storeDiagnostics(snapshot source.Snapshot, uri span.URI, dsourc
 	if fh == nil {
 		return
 	}
+
 	s.diagnosticsMu.Lock()
 	defer s.diagnosticsMu.Unlock()
 	if s.diagnostics[uri] == nil {
@@ -389,7 +458,7 @@ func (s *Server) showCriticalErrorStatus(ctx context.Context, snapshot source.Sn
 	var errMsg string
 	if err != nil {
 		event.Error(ctx, "errors loading workspace", err.MainError, tag.Snapshot.Of(snapshot.ID()), tag.Directory.Of(snapshot.View().Folder()))
-		for _, d := range err.DiagList {
+		for _, d := range err.Diagnostics {
 			s.storeDiagnostics(snapshot, d.URI, modSource, []*source.Diagnostic{d})
 		}
 		errMsg = strings.ReplaceAll(err.MainError.Error(), "\n", " ")
@@ -405,10 +474,10 @@ func (s *Server) showCriticalErrorStatus(ctx context.Context, snapshot source.Sn
 	// If an error is already shown to the user, update it or mark it as
 	// resolved.
 	if errMsg == "" {
-		s.criticalErrorStatus.End("Done.")
+		s.criticalErrorStatus.End(ctx, "Done.")
 		s.criticalErrorStatus = nil
 	} else {
-		s.criticalErrorStatus.Report(errMsg, 0)
+		s.criticalErrorStatus.Report(ctx, errMsg, 0)
 	}
 }
 
@@ -416,7 +485,15 @@ func (s *Server) showCriticalErrorStatus(ctx context.Context, snapshot source.Sn
 // If they cannot and the workspace is not otherwise unloaded, it also surfaces
 // a warning, suggesting that the user check the file for build tags.
 func (s *Server) checkForOrphanedFile(ctx context.Context, snapshot source.Snapshot, fh source.VersionedFileHandle) *source.Diagnostic {
-	if fh.Kind() != source.Go {
+	// TODO(rfindley): this function may fail to produce a diagnostic for a
+	// variety of reasons, some of which should probably not be ignored. For
+	// example, should this function be tolerant of the case where fh does not
+	// exist, or does not have a package name?
+	//
+	// It would be better to panic or report a bug in several of the cases below,
+	// so that we can move toward guaranteeing we show the user a meaningful
+	// error whenever it makes sense.
+	if snapshot.View().FileKind(fh) != source.Go {
 		return nil
 	}
 	// builtin files won't have a package, but they are never orphaned.
@@ -431,7 +508,10 @@ func (s *Server) checkForOrphanedFile(ctx context.Context, snapshot source.Snaps
 	if err != nil {
 		return nil
 	}
-	spn, err := span.NewRange(snapshot.FileSet(), pgf.File.Name.Pos(), pgf.File.Name.End()).Span()
+	if !pgf.File.Name.Pos().IsValid() {
+		return nil
+	}
+	spn, err := span.NewRange(pgf.Tok, pgf.File.Name.Pos(), pgf.File.Name.End()).Span()
 	if err != nil {
 		return nil
 	}
@@ -465,6 +545,7 @@ func (s *Server) publishDiagnostics(ctx context.Context, final bool, snapshot so
 	s.diagnosticsMu.Lock()
 	defer s.diagnosticsMu.Unlock()
 
+	// TODO(rfindley): remove this noisy (and not useful) logging.
 	published := 0
 	defer func() {
 		log.Trace.Logf(ctx, "published %d diagnostics", published)
@@ -476,7 +557,7 @@ func (s *Server) publishDiagnostics(ctx context.Context, final bool, snapshot so
 
 		// If we've already delivered diagnostics for a future snapshot for this
 		// file, do not deliver them.
-		if r.snapshotID > snapshot.ID() {
+		if r.publishedSnapshotID > snapshot.ID() {
 			continue
 		}
 		anyReportsChanged := false
@@ -505,10 +586,10 @@ func (s *Server) publishDiagnostics(ctx context.Context, final bool, snapshot so
 		}
 		source.SortDiagnostics(diags)
 		hash := hashDiagnostics(diags...)
-		if hash == r.publishedHash {
+		if hash == r.publishedHash && !r.mustPublish {
 			// Update snapshotID to be the latest snapshot for which this diagnostic
 			// hash is valid.
-			r.snapshotID = snapshot.ID()
+			r.publishedSnapshotID = snapshot.ID()
 			continue
 		}
 		var version int32
@@ -522,7 +603,8 @@ func (s *Server) publishDiagnostics(ctx context.Context, final bool, snapshot so
 		}); err == nil {
 			published++
 			r.publishedHash = hash
-			r.snapshotID = snapshot.ID()
+			r.mustPublish = false // diagnostics have been successfully published
+			r.publishedSnapshotID = snapshot.ID()
 			for dsource, hash := range reportHashes {
 				report := r.reports[dsource]
 				report.publishedHash = hash

@@ -14,7 +14,6 @@ import (
 	"github.com/charlievieth/xtools/lsp/command"
 	"github.com/charlievieth/xtools/lsp/protocol"
 	"github.com/charlievieth/xtools/lsp/source"
-	"github.com/charlievieth/xtools/span"
 )
 
 // LensFuncs returns the supported lensFuncs for go.mod files.
@@ -23,6 +22,7 @@ func LensFuncs() map[command.Command]source.LensFunc {
 		command.UpgradeDependency: upgradeLenses,
 		command.Tidy:              tidyLens,
 		command.Vendor:            vendorLens,
+		command.RunVulncheckExp:   vulncheckLenses,
 	}
 }
 
@@ -129,7 +129,7 @@ func moduleStmtRange(fh source.FileHandle, pm *source.ParsedModule) (protocol.Ra
 		return protocol.Range{}, fmt.Errorf("no module statement in %s", fh.URI())
 	}
 	syntax := pm.File.Module.Syntax
-	return lineToRange(pm.Mapper, fh.URI(), syntax.Start, syntax.End)
+	return source.LineToRange(pm.Mapper, fh.URI(), syntax.Start, syntax.End)
 }
 
 // firstRequireRange returns the range for the first "require" in the given
@@ -150,19 +150,31 @@ func firstRequireRange(fh source.FileHandle, pm *source.ParsedModule) (protocol.
 	if start.Byte == 0 || firstRequire.Start.Byte < start.Byte {
 		start, end = firstRequire.Start, firstRequire.End
 	}
-	return lineToRange(pm.Mapper, fh.URI(), start, end)
+	return source.LineToRange(pm.Mapper, fh.URI(), start, end)
 }
 
-func lineToRange(m *protocol.ColumnMapper, uri span.URI, start, end modfile.Position) (protocol.Range, error) {
-	line, col, err := m.Converter.ToPosition(start.Byte)
-	if err != nil {
-		return protocol.Range{}, err
+func vulncheckLenses(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]protocol.CodeLens, error) {
+	pm, err := snapshot.ParseMod(ctx, fh)
+	if err != nil || pm.File == nil {
+		return nil, err
 	}
-	s := span.NewPoint(line, col, start.Byte)
-	line, col, err = m.Converter.ToPosition(end.Byte)
+	// Place the codelenses near the module statement.
+	// A module may not have the require block,
+	// but vulnerabilities can exist in standard libraries.
+	uri := protocol.URIFromSpanURI(fh.URI())
+	rng, err := moduleStmtRange(fh, pm)
 	if err != nil {
-		return protocol.Range{}, err
+		return nil, err
 	}
-	e := span.NewPoint(line, col, end.Byte)
-	return m.Range(span.New(uri, s, e))
+
+	vulncheck, err := command.NewRunVulncheckExpCommand("Run govulncheck", command.VulncheckArgs{
+		URI:     uri,
+		Pattern: "./...",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []protocol.CodeLens{
+		{Range: rng, Command: vulncheck},
+	}, nil
 }

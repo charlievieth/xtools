@@ -28,10 +28,8 @@ func main() {}
 
 `
 	WithOptions(
-		Modes(Singleton),
-		EditorConfig{
-			AllExperiments: true,
-		},
+		Modes(Default),
+		Settings{"allExperiments": true},
 	).Run(t, src, func(t *testing.T, env *Env) {
 		params := &protocol.SemanticTokensParams{}
 		const badURI = "http://foo"

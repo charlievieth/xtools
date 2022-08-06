@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"github.com/charlievieth/xtools/analysisinternal"
 	"os"
 
 	"github.com/charlievieth/xtools/gopls/hooks"
@@ -24,6 +25,10 @@ import (
 )
 
 func main() {
+	// In 1.18, diagnostics for Fuzz tests must not be used by cmd/vet.
+	// So the code for Fuzz tests diagnostics is guarded behind flag analysisinternal.DiagnoseFuzzTests
+	// Turn on analysisinternal.DiagnoseFuzzTests for gopls
+	analysisinternal.DiagnoseFuzzTests = true
 	ctx := context.Background()
 	tool.Main(ctx, cmd.New("gopls", "", nil, hooks.Options), os.Args[1:])
 }
